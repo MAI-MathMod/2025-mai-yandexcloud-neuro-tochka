@@ -23,8 +23,8 @@ ENV SERVICE=${SERVICE}
 # admin → listens on 8096; user → listens on 8080
 CMD ["sh", "-c", "\
     if [ \"$SERVICE\" = \"admin\" ]; then \
-    python admin_bot.py; \
+    python admin_bot_backup.py; \
     else \
-    python user_bot.py; \
+    python user_bot_backup.py; \
     fi \
     "]
