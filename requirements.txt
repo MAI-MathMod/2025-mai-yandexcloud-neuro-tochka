@@ -1,0 +1,6 @@
+aiogram
+flask
+python-dotenv
+yandex-cloud-ml-sdk
+aiohttp
+python-jose

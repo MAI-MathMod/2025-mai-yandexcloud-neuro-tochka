@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  admin-bot:
+    build:
+      context: .
+      args:
+        SERVICE: admin
+    env_file:
+      - .env # put ADMIN_BOT_TOKEN, JWT_SECRET, SUPERUSER_ID, etc.
+    ports:
+      - "8096:8096"
+    restart: unless-stopped
+
+  user-bot:
+    build:
+      context: .
+      args:
+        SERVICE: user
+    env_file:
+      - .env # put USER_BOT_TOKEN, YC_* variables, DEBUG_MODE, etc.
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
