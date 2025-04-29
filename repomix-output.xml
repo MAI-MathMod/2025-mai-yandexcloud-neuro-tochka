@@ -45,18 +45,20 @@ The content is organized as follows:
 
 <directory_structure>
 .gitignore
+admin_bot_backup.py
 admin_bot.py
 docker-compose.yml
 Dockerfile
 requirements.txt
 test.sh
+user_bot_backup.py
 user_bot.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="admin_bot.py">
+<file path="admin_bot_backup.py">
 #!/usr/bin/env python3
 import os
 import sys
@@ -87,7 +89,7 @@ from aiogram.filters import Command
 from jose import jwt, JWTError
 from asyncio import run_coroutine_threadsafe
 
-# ─── Configuration & Logging ────────────────────────────────────────────────
+# ─── Configuration & Logging ─────────────────────────────────────────────────
 
 load_dotenv()
 logging.basicConfig(
@@ -96,8 +98,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
-USER_BOT_REPLY_URL = os.getenv("USER_BOT_REPLY_URL", "http://localhost:8080/reply")
-USER_BOT_CLAIM_URL = os.getenv("USER_BOT_CLAIM_URL", "http://localhost:8080/claim")
+# Ensure these point at your User-Bot service host/container
+USER_BOT_REPLY_URL = os.getenv("USER_BOT_REPLY_URL", "http://user-bot:8080/reply")
+USER_BOT_CLAIM_URL = os.getenv("USER_BOT_CLAIM_URL", "http://user-bot:8080/claim")
 ADMIN_BOT_HEALTH_URL = os.getenv("ADMIN_BOT_HEALTH_URL", "http://localhost:8096/health")
 USER_BOT_HEALTH_URL = os.getenv("USER_BOT_HEALTH_URL", "http://localhost:8080/health")
 SUPERUSER_ID = int(os.getenv("SUPERUSER_ID", "0"))
@@ -135,7 +138,8 @@ def init_db():
               id INTEGER PRIMARY KEY,
               telegram_id INTEGER UNIQUE NOT NULL,
               is_superuser BOOLEAN NOT NULL DEFAULT 0
-            )"""
+            )
+            """
         )
         cur.execute(
             """
@@ -144,7 +148,8 @@ def init_db():
               telegram_id INTEGER NOT NULL,
               salt TEXT NOT NULL,
               expires_at TEXT NOT NULL
-            )"""
+            )
+            """
         )
         cur.execute(
             "INSERT OR IGNORE INTO admins (telegram_id, is_superuser) VALUES (?,1)",
@@ -217,6 +222,7 @@ def receive_user_followup():
     if not admin_id:
         return jsonify(error="Ticket not claimed"), 400
 
+    # forward follow-up to claimed admin
     run_coroutine_threadsafe(
         bot.send_message(
             chat_id=admin_id, text=f"📨 Follow-up from user `{ticket_id}`:\n{text}"
@@ -295,7 +301,7 @@ async def cmd_open(message: Message):
     if not is_admin(message.from_user.id):
         return await message.reply("❌ Unauthorized.")
     lines = [
-        f"🆔 *{tid}*  👤 `{info['user_id']}`"
+        f'🆔 *{tid}*  👤 `{info["user_id"]}`'
         for tid, info in tickets.items()
         if info["status"] == "open"
     ]
@@ -309,7 +315,7 @@ async def cmd_pending(message: Message):
     if not is_admin(message.from_user.id):
         return await message.reply("❌ Unauthorized.")
     lines = [
-        f"🆔 *{tid}*  👤 `{info['user_id']}`"
+        f'🆔 *{tid}*  👤 `{info["user_id"]}`'
         for tid, info in tickets.items()
         if info["status"] == "pending"
     ]
@@ -426,7 +432,6 @@ async def cb_claim_ticket(call: CallbackQuery):
     active_conversations[admin_id] = tid
     browsing_sessions.pop(admin_id, None)
 
-    # Notify user-bot of claim, including user_id
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
         await sess.post(
             USER_BOT_CLAIM_URL, json={"ticket_id": tid, "user_id": info["user_id"]}
@@ -461,27 +466,40 @@ async def cb_close(call: CallbackQuery):
     )
 
     username = call.from_user.username or call.from_user.full_name
+    msg = f"🔒 Ticket `{tid}` closed by {username}."
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
-        # attempt to notify; if 404, re-claim then retry
-        resp = await sess.post(
-            USER_BOT_REPLY_URL,
-            json={
-                "ticket_id": tid,
-                "text": f"🔒 Ticket `{tid}` closed by @{username}.",
-            },
-        )
-        if resp.status == 404:
-            await sess.post(
-                USER_BOT_CLAIM_URL,
-                json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
-            )
-            await sess.post(
+        try:
+            resp = await sess.post(
                 USER_BOT_REPLY_URL,
-                json={
-                    "ticket_id": tid,
-                    "text": f"🔒 Ticket `{tid}` closed by @{username}.",
-                },
+                json={"ticket_id": tid, "text": msg},
             )
+            logger.info(
+                "POST %s → ticket %s closed notification returned %d",
+                USER_BOT_REPLY_URL,
+                tid,
+                resp.status,
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Close notification returned %d: %s", resp.status, body)
+            if resp.status == 404:
+                await sess.post(
+                    USER_BOT_CLAIM_URL,
+                    json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
+                )
+                retry_resp = await sess.post(
+                    USER_BOT_REPLY_URL,
+                    json={"ticket_id": tid, "text": msg},
+                )
+                logger.info(
+                    "Retry close POST %s → ticket %s returned %d",
+                    USER_BOT_REPLY_URL,
+                    tid,
+                    retry_resp.status,
+                )
+        except Exception:
+            logger.exception("Failed to send close notification for ticket %s", tid)
+
     await call.answer()
 
 
@@ -494,22 +512,1023 @@ async def handle_admin_chat(message: Message):
     if not tid:
         return
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
-        resp = await sess.post(
-            USER_BOT_REPLY_URL, json={"ticket_id": tid, "text": message.text}
-        )
-        if resp.status == 404:
-            # re-claim then retry
-            await sess.post(
-                USER_BOT_CLAIM_URL,
-                json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
-            )
-            await sess.post(
+        try:
+            resp = await sess.post(
                 USER_BOT_REPLY_URL, json={"ticket_id": tid, "text": message.text}
             )
+            logger.info(
+                "POST %s → ticket %s returned %d", USER_BOT_REPLY_URL, tid, resp.status
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Admin-Bot /reply returned %d: %s", resp.status, body)
+            if resp.status == 404:
+                await sess.post(
+                    USER_BOT_CLAIM_URL,
+                    json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
+                )
+                retry_resp = await sess.post(
+                    USER_BOT_REPLY_URL, json={"ticket_id": tid, "text": message.text}
+                )
+                logger.info(
+                    "Retry POST %s → ticket %s returned %d",
+                    USER_BOT_REPLY_URL,
+                    tid,
+                    retry_resp.status,
+                )
+        except Exception:
+            logger.exception("Failed to forward to User-Bot for ticket %s", tid)
+
+
+# ─── Set Up Bot Commands ──────────────────────────────────────────────────
+
+
+async def setup_bot_commands():
+    """Configure bot commands to be shown in the Telegram interface"""
+    commands = [
+        BotCommand(command="help", description="Show available commands"),
+        BotCommand(command="browse", description="Browse all tickets"),
+        BotCommand(command="open", description="List open tickets"),
+        BotCommand(command="pending", description="List pending tickets"),
+        BotCommand(command="closed", description="List closed tickets"),
+        BotCommand(command="status", description="Check system status"),
+        BotCommand(command="auth", description="Authenticate with a token"),
+    ]
+
+    # Add superuser commands
+    if SUPERUSER_ID:
+        commands.append(
+            BotCommand(
+                command="issue_token", description="Create admin token (superuser only)"
+            )
+        )
+
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+
+
+# ─── Help Command Handler ──────────────────────────────────────────────────
+
+
+@dp.message(Command(commands=["help", "start"]))
+async def cmd_help(message: Message):
+    """Handler for /help command"""
+    user_id = message.from_user.id
+    is_admin_user = is_admin(user_id)
+    is_super_user = is_superuser(user_id)
+
+    # Base welcome message
+    help_text = [
+        "👋 *Welcome to the Admin Support Bot*",
+        "",
+        "This bot allows administrators to handle user support tickets.",
+    ]
+
+    # Show different commands based on user role
+    if is_admin_user:
+        help_text.extend(
+            [
+                "",
+                "*Available Commands:*",
+                "• /browse - Browse all tickets with navigation",
+                "• /open - List all open tickets",
+                "• /pending - List tickets in progress",
+                "• /closed - List closed tickets",
+                "• /status - Check system status",
+            ]
+        )
+
+        # Direct messaging information
+        help_text.extend(
+            [
+                "",
+                "*Handling Tickets:*",
+                "• Use inline buttons to claim and respond to tickets",
+                "• Once a ticket is claimed, simply type your message to respond",
+            ]
+        )
+
+        # Extra commands for superuser
+        if is_super_user:
+            help_text.extend(
+                [
+                    "",
+                    "*Superuser Commands:*",
+                    "• /issue_token - Generate auth token for new admins",
+                ]
+            )
+    else:
+        help_text.extend(
+            [
+                "",
+                "*Authentication:*",
+                "• /auth <token> - Authenticate with admin token",
+                "",
+                "Contact the system administrator to get an authentication token.",
+            ]
+        )
+
+    # Send the help message with Markdown formatting
+    await message.reply("\n".join(help_text), parse_mode=ParseMode.MARKDOWN)
 
 
 async def main():
-    # Register slash commands
+    # Register bot commands in Telegram
+    await setup_bot_commands()
+
+    # Start polling
+    task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    try:
+        while True:
+            if pending_notifications:
+                note = pending_notifications.pop(0)
+                chat_id = note["chat_id"]
+                text = note["text"]
+                await bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN
+                )
+            await asyncio.sleep(1)
+    finally:
+        await task
+
+
+def shutdown(_sig, _frame):
+    logger.info("Shutting down…")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=8096, use_reloader=False),
+        daemon=True,
+    ).start()
+    logger.info("Flask listening on port 8096")
+
+    looptask = asyncio.new_event_loop()
+    asyncio.set_event_loop(looptask)
+    looptask.run_until_complete(main())
+</file>
+
+<file path="user_bot_backup.py">
+#!/usr/bin/env python3
+import os
+import asyncio
+import logging
+import threading
+import signal
+
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message, BotCommand, BotCommandScopeDefault
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from yandex_cloud_ml_sdk import YCloudML
+import aiohttp
+
+# ─── Configuration & Logging ─────────────────────────────────────────────────
+
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Telegram & Admin-Bot endpoints
+USER_BOT_TOKEN = os.getenv("USER_BOT_TOKEN")
+ADMIN_BOT_TICKETS_URL = os.getenv(
+    "ADMIN_BOT_TICKETS_URL", "http://admin-bot:8096/tickets"
+)
+ADMIN_BOT_MESSAGE_URL = os.getenv(
+    "ADMIN_BOT_MESSAGE_URL", "http://admin-bot:8096/message"
+)
+
+# Yandex Cloud ML SDK creds
+YC_FOLDER_ID = os.getenv("YC_FOLDER_ID")
+YC_AUTH_TOKEN = os.getenv("YC_AUTH_TOKEN")
+YC_MODEL_NAME = os.getenv("YC_MODEL_NAME", "yandexgpt")
+
+# Debug echo‐mode toggle
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("1", "true", "yes")
+
+# Validate required
+if not USER_BOT_TOKEN:
+    logger.error("Missing USER_BOT_TOKEN in .env")
+    exit(1)
+if not DEBUG_MODE and (not YC_FOLDER_ID or not YC_AUTH_TOKEN):
+    logger.error(
+        "Missing YC_FOLDER_ID or YC_AUTH_TOKEN in .env (unless DEBUG_MODE=true)"
+    )
+    exit(1)
+
+# Initialize Yandex SDK if not in debug
+sdk = None
+if not DEBUG_MODE:
+    sdk = YCloudML(folder_id=YC_FOLDER_ID, auth=YC_AUTH_TOKEN)
+
+# ─── In-Memory State ─────────────────────────────────────────────────────────
+
+dialog_history = {}  # user_id → [ {"role","content"}, … ]
+pending_tickets = {}  # user_id → ticket_id (escalated but not claimed)
+pending_ticket_to_user = {}  # ticket_id → user_id
+tickets_to_user = {}  # ticket_id → user_id (claimed)
+
+# Will hold our asyncio event loop
+polling_loop = None
+
+# ─── Flask & Aiogram Setup ─────────────────────────────────────────────────
+
+app = Flask(__name__)
+bot = Bot(token=USER_BOT_TOKEN)
+dp = Dispatcher()
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+
+async def call_yc(prompt: str) -> str:
+    """Run YandexGPT in a thread to avoid blocking the loop."""
+    model = sdk.models.completions(YC_MODEL_NAME).configure(temperature=0.5)
+    return (
+        await asyncio.get_event_loop().run_in_executor(None, lambda: model.run(prompt))
+    )[0]
+
+
+async def escalate_to_admin(user_id: int, dialog: list) -> str:
+    """
+    Send full dialog to Admin-Bot to open a ticket.
+    """
+    payload = {"user_id": user_id, "dialog": dialog}
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        resp = await sess.post(ADMIN_BOT_TICKETS_URL, json=payload)
+        resp.raise_for_status()
+        data = await resp.json()
+    ticket_id = data["ticket_id"]
+    pending_tickets[user_id] = ticket_id
+    pending_ticket_to_user[ticket_id] = user_id
+    logger.info("Escalated user %s → ticket %s", user_id, ticket_id)
+    return ticket_id
+
+
+async def forward_to_admin(ticket_id: str, text: str):
+    """
+    Forward a user message to Admin-Bot after claim.
+    """
+    payload = {"ticket_id": ticket_id, "text": text}
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            resp = await sess.post(ADMIN_BOT_MESSAGE_URL, json=payload)
+            logger.info(
+                "Forward to admin POST %s → %s returned %d",
+                ADMIN_BOT_MESSAGE_URL,
+                ticket_id,
+                resp.status,
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Admin-Bot rejected forward (%d): %s", resp.status, body)
+    except Exception:
+        logger.exception("Failed to forward to admin for ticket %s", ticket_id)
+
+
+# ─── Set Up Bot Commands ─────────────────────────────────────────────────────
+
+async def setup_bot_commands():
+    """Configure bot commands to be shown in the Telegram interface"""
+    commands = [
+        BotCommand(command="start", description="Start the bot and see welcome message"),
+        BotCommand(command="help", description="Show available commands and how to use the bot"),
+        BotCommand(command="escalate", description="Escalate your conversation to a human admin"),
+    ]
+    
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+
+
+# ─── Help and Welcome Command Handlers ──────────────────────────────────────
+
+@dp.message(Command(commands=["start"]))
+async def cmd_start(message: Message):
+    uid = message.from_user.id
+    welcome_text = [
+        "👋 *Welcome to the Support Bot!*",
+        "",
+        "I'm here to help answer your questions. You can simply chat with me naturally, and I'll do my best to assist you.",
+        "",
+        "If at any point you need to speak with a human admin, just type */escalate*.",
+        "",
+        "Type */help* to see all available commands.",
+    ]
+    
+    # Initialize dialog history if this is the first message
+    if uid not in dialog_history:
+        dialog_history[uid] = []
+    
+    await message.reply("\n".join(welcome_text), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command(commands=["help"]))
+async def cmd_help(message: Message):
+    help_text = [
+        "📚 *Available Commands:*",
+        "",
+        "• */start* - Start or restart the bot",
+        "• */help* - Show this help message",
+        "• */escalate* - Connect with a human admin",
+        "",
+        "🔍 *How to use this bot:*",
+        "",
+        "1. Simply type your questions or requests naturally",
+        "2. I'll do my best to help you right away",
+        "3. If I can't resolve your issue, use */escalate* to reach a human admin",
+        "",
+        "💬 *When talking to an admin:*",
+        "• Once your conversation is escalated to an admin, all your messages will be forwarded to them",
+        "• Wait for the admin to respond - you'll see their replies here",
+    ]
+    
+    await message.reply("\n".join(help_text), parse_mode=ParseMode.MARKDOWN)
+
+# ─── Escalate Command Handler ───────────────────────────────────────────────
+
+@dp.message(Command(commands=["escalate"]))
+async def cmd_escalate(message: Message):
+    uid = message.from_user.id
+    
+    # Already claimed
+    if uid in tickets_to_user.values():
+        return await message.reply(
+            "ℹ️ *You're already connected with an admin.*\n\nContinue your conversation here.", 
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # Already pending
+    if uid in pending_tickets:
+        return await message.reply(
+            f"⏳ *Your ticket* `{pending_tickets[uid]}` *is waiting for an admin.*\n\nPlease be patient, an admin will be with you soon.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # Get history or initialize if needed
+    hist = dialog_history.setdefault(uid, [])
+    
+    try:
+        ticket_id = await escalate_to_admin(uid, hist)
+        return await message.reply(
+            f"✅ *Your request has been escalated to an admin.*\n\nTicket ID: `{ticket_id}`\n\nAn admin will respond as soon as possible. Feel free to continue providing details while you wait.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.exception("Escalation failed for user %s", uid)
+        return await message.reply(
+            "❌ *Unable to escalate your request at this time.*\n\nPlease try again later or continue the conversation with me.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# ─── Handle Regular Messages ───────────────────────────────────────────────
+
+@dp.message()
+async def handle_user_message(message: Message):
+    uid = message.from_user.id
+    text = message.text or ""
+    hist = dialog_history.setdefault(uid, [])
+    hist.append({"role": "user", "content": text})
+
+    # 1) Already claimed → forward every message
+    if uid in tickets_to_user.values():
+        # find ticket_id by value
+        ticket_id = next(k for k, v in tickets_to_user.items() if v == uid)
+        await forward_to_admin(ticket_id, text)
+        return await message.reply(
+            "📨 *Your message has been sent to the admin.*\n\nPlease wait for their response.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # 2) Escalated but not claimed → politely wait
+    if uid in pending_tickets:
+        return await message.reply(
+            f"⏳ *Your ticket* `{pending_tickets[uid]}` *is waiting for an admin to respond.*\n\nThank you for your patience.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # 3) Debug echo
+    if DEBUG_MODE:
+        reply = text
+    else:
+        # 4) LLM response
+        prompt = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in hist)
+        try:
+            reply = await call_yc(prompt)
+        except Exception:
+            logger.exception("LLM call failed for user %s", uid)
+            return await message.reply(
+                "❌ *I'm having trouble processing your request right now.*\n\nPlease try again later or type */escalate* to reach a human admin.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # 5) Model-triggered escalation hint
+        if "[escalate]" in reply.lower():
+            try:
+                ticket_id = await escalate_to_admin(uid, hist)
+                return await message.reply(
+                    f"✅ *I've escalated your request to a human admin.*\n\nTicket ID: `{ticket_id}`\n\nAn admin will respond as soon as possible.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                logger.exception("Escalation failed for user %s in model hint", uid)
+                return await message.reply(
+                    "❌ *I tried to escalate your request to an admin, but there was an issue.*\n\nPlease try using the */escalate* command directly.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+
+    # 6) Normal reply
+    hist.append({"role": "assistant", "content": reply})
+    await message.reply(reply)
+
+
+# ─── Flask: Health Check ───────────────────────────────────────────────────
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+# ─── Flask: Receive Claim from Admin-Bot ────────────────────────────────────
+
+
+@app.route("/claim", methods=["POST"])
+def receive_claim():
+    data = request.json or {}
+    ticket_id = data.get("ticket_id")
+    user_id = data.get("user_id") or pending_ticket_to_user.get(ticket_id)
+    if not ticket_id or user_id is None:
+        return jsonify(error="Missing ticket_id or user_id"), 400
+
+    logger.info("Incoming /claim for ticket %s: user_id %s", ticket_id, user_id)
+    # clear any pending state
+    pending_tickets.pop(user_id, None)
+    pending_ticket_to_user.pop(ticket_id, None)
+    # mark claimed
+    tickets_to_user[ticket_id] = user_id
+    return jsonify(status="claimed"), 200
+
+
+# ─── Flask: Receive Replies / Closures from Admin-Bot ───────────────────────
+
+
+@app.route("/reply", methods=["POST"])
+def receive_admin_reply():
+    data = request.json or {}
+    ticket_id = data.get("ticket_id")
+    text = data.get("text")
+    if not ticket_id or text is None:
+        return jsonify(error="Missing ticket_id or text"), 400
+
+    user_id = tickets_to_user.get(ticket_id)
+    if not user_id:
+        return jsonify(error="Unknown or unclaimed ticket"), 404
+
+    logger.info("Incoming /reply for ticket %s: %r", ticket_id, text)
+    try:
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                chat_id=user_id, 
+                text=f"👤 *Admin Reply:*\n\n{text}", 
+                parse_mode=ParseMode.MARKDOWN
+            ), 
+            polling_loop
+        )
+    except Exception:
+        logger.exception(
+            "Failed to send message to user %s for ticket %s", user_id, ticket_id
+        )
+        return jsonify(error="Send failed"), 500
+
+    return jsonify(status="sent"), 200
+
+
+# ─── Bootstrap: Run Flask + Telegram Polling ─────────────────────────────────
+
+if __name__ == "__main__":
+    # 1) Create & install asyncio loop
+    polling_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(polling_loop)
+
+    # 2) Start Flask in background thread
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=8080, use_reloader=False),
+        daemon=True,
+    ).start()
+    logger.info("Flask listening on port 8080")
+
+    # 3) Signal handlers for graceful shutdown
+    def _shutdown(_sig, _frame):
+        logger.info("Shutdown signal received; stopping.")
+        polling_loop.stop()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    # 4) Telegram polling in foreground
+    try:
+        # Set up commands before starting polling
+        polling_loop.run_until_complete(setup_bot_commands())
+        
+        polling_loop.create_task(dp.start_polling(bot, skip_updates=True))
+        polling_loop.run_forever()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception:
+        logger.exception("Unhandled exception in main loop")
+    finally:
+        polling_loop.close()
+</file>
+
+<file path="admin_bot.py">
+#!/usr/bin/env python3
+import os
+import sys
+import threading
+import asyncio
+import signal
+import logging
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
+import aiohttp
+
+from aiogram import Bot, Dispatcher
+from aiogram.types import (
+    Message,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    CallbackQuery,
+    BotCommand,
+    BotCommandScopeDefault,
+)
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+
+from jose import jwt, JWTError
+from asyncio import run_coroutine_threadsafe
+
+# ─── Configuration & Logging ─────────────────────────────────────────────────
+
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
+# Ensure these point at your User-Bot service host/container
+USER_BOT_REPLY_URL = os.getenv("USER_BOT_REPLY_URL", "http://user-bot:8080/reply")
+USER_BOT_CLAIM_URL = os.getenv("USER_BOT_CLAIM_URL", "http://user-bot:8080/claim")
+ADMIN_BOT_HEALTH_URL = os.getenv("ADMIN_BOT_HEALTH_URL", "http://localhost:8096/health")
+USER_BOT_HEALTH_URL = os.getenv("USER_BOT_HEALTH_URL", "http://localhost:8080/health")
+SUPERUSER_ID = int(os.getenv("SUPERUSER_ID", "0"))
+JWT_SECRET = os.getenv("JWT_SECRET")
+DB_PATH = os.getenv("DB_PATH", "admin_bot.db")
+TOKEN_EXP_MINUTES = int(os.getenv("TOKEN_EXPIRATION_MINUTES", "30"))
+
+if not (ADMIN_BOT_TOKEN and JWT_SECRET and SUPERUSER_ID):
+    logger.error("Missing required environment variables; exiting.")
+    sys.exit(1)
+
+# ─── In-Memory State ─────────────────────────────────────────────────────────
+
+tickets = {}  # ticket_id → { user_id, dialog, status, admin_id }
+pending_notifications = []  # queue of notifications for superuser
+active_conversations = {}  # admin_id → ticket_id
+browsing_sessions = {}  # admin_id → { tickets: [...], index: int }
+
+# ─── Flask & Aiogram Setup ──────────────────────────────────────────────────
+
+app = Flask(__name__)
+bot = Bot(token=ADMIN_BOT_TOKEN)
+dp = Dispatcher()
+looptask = None  # will hold our asyncio event loop
+
+# ─── Database Helpers ───────────────────────────────────────────────────────
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+              id INTEGER PRIMARY KEY,
+              telegram_id INTEGER UNIQUE NOT NULL,
+              is_superuser BOOLEAN NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tokens (
+              token TEXT PRIMARY KEY,
+              telegram_id INTEGER NOT NULL,
+              salt TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO admins (telegram_id, is_superuser) VALUES (?,1)",
+            (SUPERUSER_ID,),
+        )
+        db.commit()
+
+
+def is_admin(tg_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as db:
+        return bool(
+            db.execute(
+                "SELECT 1 FROM admins WHERE telegram_id = ?", (tg_id,)
+            ).fetchone()
+        )
+
+
+def is_superuser(tg_id: int) -> bool:
+    return tg_id == SUPERUSER_ID
+
+
+init_db()
+
+# ─── Flask Endpoints ────────────────────────────────────────────────────────
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(status="ok"), 200
+
+
+@app.route("/tickets", methods=["POST"])
+def receive_ticket():
+    data = request.json or {}
+    user_id = data.get("user_id")
+    dialog = data.get("dialog")
+    if not user_id or not isinstance(dialog, list):
+        return jsonify(error="Missing or invalid user_id/dialog"), 400
+
+    ticket_id = str(uuid.uuid4())
+    tickets[ticket_id] = {
+        "user_id": user_id,
+        "dialog": dialog,
+        "status": "open",
+        "admin_id": None,
+    }
+    pending_notifications.append(
+        {
+            "chat_id": SUPERUSER_ID,
+            "ticket_id": ticket_id,
+            "text": f"🆕 New ticket `{ticket_id}` from user `{user_id}`.",
+        }
+    )
+    logger.info("Ticket %s created by user %s", ticket_id, user_id)
+    return jsonify(ticket_id=ticket_id), 200
+
+
+@app.route("/message", methods=["POST"])
+def receive_user_followup():
+    data = request.json or {}
+    ticket_id = data.get("ticket_id")
+    text = data.get("text")
+    if not ticket_id or text is None:
+        return jsonify(error="Missing ticket_id or text"), 400
+
+    info = tickets.get(ticket_id)
+    if not info:
+        return jsonify(error="Unknown ticket_id"), 404
+    admin_id = info.get("admin_id")
+    if not admin_id:
+        return jsonify(error="Ticket not claimed"), 400
+
+    # forward follow-up to claimed admin
+    run_coroutine_threadsafe(
+        bot.send_message(
+            chat_id=admin_id, text=f"📨 Follow-up from user `{ticket_id}`:\n{text}"
+        ),
+        looptask,
+    )
+    return jsonify(status="forwarded"), 200
+
+
+# ─── Aiogram Command Handlers ──────────────────────────────────────────────
+
+
+@dp.message(Command(commands=["issue_token"]))
+async def cmd_issue_token(message: Message):
+    if not is_superuser(message.from_user.id):
+        return await message.reply("❌ Only superuser can issue tokens.")
+    salt = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=TOKEN_EXP_MINUTES)
+    payload = {
+        "telegram_id": message.from_user.id,
+        "salt": salt,
+        "iat": now.timestamp(),
+        "exp": exp.timestamp(),
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            "INSERT INTO tokens (token, telegram_id, salt, expires_at) VALUES (?,?,?,?)",
+            (token, message.from_user.id, salt, exp.isoformat()),
+        )
+        db.commit()
+
+    await message.reply("✅ Admin token created:")
+    await message.answer(token)
+
+
+@dp.message(Command(commands=["auth"]))
+async def cmd_auth(message: Message):
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return await message.reply("Usage: /auth <token>")
+    token = parts[1]
+
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            "SELECT telegram_id, salt, expires_at FROM tokens WHERE token = ?", (token,)
+        ).fetchone()
+
+    if not row:
+        return await message.reply("❌ Invalid or revoked token.")
+    stored_tg, salt, exp_str = row
+    if datetime.now(timezone.utc) > datetime.fromisoformat(exp_str):
+        return await message.reply("❌ Token expired.")
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except JWTError:
+        return await message.reply("❌ Invalid token signature.")
+    if decoded.get("telegram_id") != stored_tg or decoded.get("salt") != salt:
+        return await message.reply("❌ Token mismatch.")
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            "INSERT OR IGNORE INTO admins (telegram_id, is_superuser) VALUES (?,0)",
+            (message.from_user.id,),
+        )
+        db.execute("DELETE FROM tokens WHERE token = ?", (token,))
+        db.commit()
+
+    await message.reply("✅ You are now authenticated as admin.")
+
+
+@dp.message(Command(commands=["open"]))
+async def cmd_open(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ Unauthorized.")
+    lines = [
+        f'🆔 *{tid}*  👤 `{info["user_id"]}`'
+        for tid, info in tickets.items()
+        if info["status"] == "open"
+    ]
+    await message.reply(
+        "\n".join(lines) or "No open tickets.", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@dp.message(Command(commands=["pending"]))
+async def cmd_pending(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ Unauthorized.")
+    lines = [
+        f'🆔 *{tid}*  👤 `{info["user_id"]}`'
+        for tid, info in tickets.items()
+        if info["status"] == "pending"
+    ]
+    await message.reply(
+        "\n".join(lines) or "No pending tickets.", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@dp.message(Command(commands=["closed"]))
+async def cmd_closed(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ Unauthorized.")
+    lines = [
+        f"🆔 *{tid}*" for tid, info in tickets.items() if info["status"] == "closed"
+    ]
+    await message.reply(
+        "\n".join(lines) or "No closed tickets.", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@dp.message(Command(commands=["status"]))
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("❌ Unauthorized.")
+    async with aiohttp.ClientSession() as sess:
+        try:
+            r1 = await sess.get(ADMIN_BOT_HEALTH_URL)
+            a_stat = "Online" if r1.status == 200 else f"Error {r1.status}"
+        except Exception as e:
+            a_stat = f"Down ({e})"
+        try:
+            r2 = await sess.get(USER_BOT_HEALTH_URL)
+            u_stat = "Online" if r2.status == 200 else f"Error {r2.status}"
+        except Exception as e:
+            u_stat = f"Down ({e})"
+    await message.reply(
+        f"🤖 *Service Status*\n• Admin Bot: {a_stat}\n• User Bot: {u_stat}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@dp.message(Command(commands=["browse"]))
+async def cmd_browse(message: Message):
+    admin_id = message.from_user.id
+    if not is_admin(admin_id):
+        return await message.reply("❌ Unauthorized.")
+    open_ids = [tid for tid, info in tickets.items() if info["status"] == "open"]
+    if not open_ids:
+        return await message.reply("No open tickets.")
+    browsing_sessions[admin_id] = {"tickets": open_ids, "index": 0}
+    await send_ticket_card(admin_id, open_ids[0], is_new=True)
+
+
+async def send_ticket_card(admin_id: int, ticket_id: str, is_new=False, edit_msg=None):
+    session = browsing_sessions[admin_id]
+    idx = session["tickets"].index(ticket_id)
+    info = tickets[ticket_id]
+    conv = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}" for m in info["dialog"]
+    )
+    text = f"🆔 *{ticket_id}*  👤 `{info['user_id']}`\n\n*Conversation:*\n{conv}"
+
+    nav_buttons = []
+    if idx > 0:
+        nav_buttons.append(
+            InlineKeyboardButton(text="⬅️ Prev", callback_data="browse:prev")
+        )
+    if idx < len(session["tickets"]) - 1:
+        nav_buttons.append(
+            InlineKeyboardButton(text="Next ➡️", callback_data="browse:next")
+        )
+    claim_btn = InlineKeyboardButton(text="🗂️ Claim", callback_data=f"claim:{ticket_id}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[nav_buttons, [claim_btn]])
+
+    if is_new:
+        await bot.send_message(
+            admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
+    else:
+        await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("browse:"))
+async def cb_browse(call: CallbackQuery):
+    admin_id = call.from_user.id
+    session = browsing_sessions.get(admin_id)
+    if not session:
+        return await call.answer("No browsing session.", show_alert=True)
+
+    direction = call.data.split(":", 1)[1]
+    idx = session["index"]
+    if direction == "prev" and idx > 0:
+        session["index"] -= 1
+    elif direction == "next" and idx < len(session["tickets"]) - 1:
+        session["index"] += 1
+    else:
+        return await call.answer()
+
+    new_tid = session["tickets"][session["index"]]
+    await send_ticket_card(admin_id, new_tid, is_new=False, edit_msg=call.message)
+    await call.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("claim:"))
+async def cb_claim_ticket(call: CallbackQuery):
+    admin_id = call.from_user.id
+    tid = call.data.split(":", 1)[1]
+    info = tickets.get(tid)
+    if not info or info["status"] != "open":
+        return await call.answer("Cannot claim this ticket.", show_alert=True)
+
+    tickets[tid]["status"] = "pending"
+    tickets[tid]["admin_id"] = admin_id
+    active_conversations[admin_id] = tid
+    browsing_sessions.pop(admin_id, None)
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+        await sess.post(
+            USER_BOT_CLAIM_URL, json={"ticket_id": tid, "user_id": info["user_id"]}
+        )
+
+    close_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Close Ticket", callback_data=f"close:{tid}")]
+        ]
+    )
+    await call.message.edit_text(
+        f"🎫 You claimed ticket *{tid}*. Send messages below or close when done.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=close_kb,
+    )
+    await call.answer("Ticket claimed.")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("close:"))
+async def cb_close(call: CallbackQuery):
+    admin_id = call.from_user.id
+    tid = call.data.split(":", 1)[1]
+    if active_conversations.get(admin_id) != tid:
+        return await call.answer("❌ Not on that ticket.", show_alert=True)
+
+    tickets[tid]["status"] = "closed"
+    active_conversations.pop(admin_id, None)
+
+    await call.message.edit_reply_markup()
+    await call.message.reply(
+        f"✅ Ticket *{tid}* closed.", parse_mode=ParseMode.MARKDOWN
+    )
+
+    username = call.from_user.username or call.from_user.full_name
+    msg = f"🔒 Ticket `{tid}` closed by @{username}."
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+        try:
+            resp = await sess.post(
+                USER_BOT_REPLY_URL,
+                json={"ticket_id": tid, "text": msg},
+            )
+            logger.info(
+                "POST %s → ticket %s closed notification returned %d",
+                USER_BOT_REPLY_URL,
+                tid,
+                resp.status,
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Close notification returned %d: %s", resp.status, body)
+            if resp.status == 404:
+                await sess.post(
+                    USER_BOT_CLAIM_URL,
+                    json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
+                )
+                retry_resp = await sess.post(
+                    USER_BOT_REPLY_URL,
+                    json={"ticket_id": tid, "text": msg},
+                )
+                logger.info(
+                    "Retry close POST %s → ticket %s returned %d",
+                    USER_BOT_REPLY_URL,
+                    tid,
+                    retry_resp.status,
+                )
+        except Exception:
+            logger.exception("Failed to send close notification for ticket %s", tid)
+
+    await call.answer()
+
+
+@dp.message()
+async def handle_admin_chat(message: Message):
+    admin_id = message.from_user.id
+    if not message.text or message.text.startswith("/"):
+        return
+    tid = active_conversations.get(admin_id)
+    if not tid:
+        return
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+        try:
+            resp = await sess.post(
+                USER_BOT_REPLY_URL, json={"ticket_id": tid, "text": message.text}
+            )
+            logger.info(
+                "POST %s → ticket %s returned %d", USER_BOT_REPLY_URL, tid, resp.status
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Admin-Bot /reply returned %d: %s", resp.status, body)
+            if resp.status == 404:
+                await sess.post(
+                    USER_BOT_CLAIM_URL,
+                    json={"ticket_id": tid, "user_id": tickets[tid]["user_id"]},
+                )
+                retry_resp = await sess.post(
+                    USER_BOT_REPLY_URL, json={"ticket_id": tid, "text": message.text}
+                )
+                logger.info(
+                    "Retry POST %s → ticket %s returned %d",
+                    USER_BOT_REPLY_URL,
+                    tid,
+                    retry_resp.status,
+                )
+        except Exception:
+            logger.exception("Failed to forward to User-Bot for ticket %s", tid)
+
+
+async def main():
     commands = [
         BotCommand(command="issue_token", description="Generate an admin JWT token"),
         BotCommand(command="auth", description="Authenticate as admin"),
@@ -532,14 +1551,12 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start Flask on port 8096
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=8096, use_reloader=False),
         daemon=True,
     ).start()
     logger.info("Flask listening on port 8096")
 
-    # Start Aiogram polling loop
     looptask = asyncio.new_event_loop()
     asyncio.set_event_loop(looptask)
     looptask.run_until_complete(main())
@@ -656,19 +1673,21 @@ from aiogram.types import Message
 from yandex_cloud_ml_sdk import YCloudML
 import aiohttp
 
-# ─── Configuration & Logging ────────────────────────────────────────────────
+# ─── Configuration & Logging ─────────────────────────────────────────────────
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # Telegram & Admin-Bot endpoints
 USER_BOT_TOKEN = os.getenv("USER_BOT_TOKEN")
 ADMIN_BOT_TICKETS_URL = os.getenv(
-    "ADMIN_BOT_TICKETS_URL", "http://localhost:8096/tickets"
+    "ADMIN_BOT_TICKETS_URL", "http://admin-bot:8096/tickets"
 )
 ADMIN_BOT_MESSAGE_URL = os.getenv(
-    "ADMIN_BOT_MESSAGE_URL", "http://localhost:8096/message"
+    "ADMIN_BOT_MESSAGE_URL", "http://admin-bot:8096/message"
 )
 
 # Yandex Cloud ML SDK creds
@@ -699,7 +1718,7 @@ if not DEBUG_MODE:
 dialog_history = {}  # user_id → [ {"role","content"}, … ]
 pending_tickets = {}  # user_id → ticket_id (escalated but not claimed)
 pending_ticket_to_user = {}  # ticket_id → user_id
-user_to_ticket = {}  # user_id → ticket_id (claimed)
+tickets_to_user = {}  # ticket_id → user_id (claimed)
 
 # Will hold our asyncio event loop
 polling_loop = None
@@ -734,6 +1753,7 @@ async def escalate_to_admin(user_id: int, dialog: list) -> str:
     ticket_id = data["ticket_id"]
     pending_tickets[user_id] = ticket_id
     pending_ticket_to_user[ticket_id] = user_id
+    logger.info("Escalated user %s → ticket %s", user_id, ticket_id)
     return ticket_id
 
 
@@ -746,11 +1766,17 @@ async def forward_to_admin(ticket_id: str, text: str):
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             resp = await sess.post(ADMIN_BOT_MESSAGE_URL, json=payload)
+            logger.info(
+                "Forward to admin POST %s → %s returned %d",
+                ADMIN_BOT_MESSAGE_URL,
+                ticket_id,
+                resp.status,
+            )
             if resp.status != 200:
                 body = await resp.text()
-                logger.warning("Admin-Bot rejected forward: %s %s", resp.status, body)
+                logger.warning("Admin-Bot rejected forward (%d): %s", resp.status, body)
     except Exception:
-        logger.exception("Failed to forward to admin")
+        logger.exception("Failed to forward to admin for ticket %s", ticket_id)
 
 
 # ─── Telegram: Incoming User Messages ────────────────────────────────────────
@@ -764,8 +1790,9 @@ async def handle_user_message(message: Message):
     hist.append({"role": "user", "content": text})
 
     # 1) Already claimed → forward every message
-    if uid in user_to_ticket:
-        ticket_id = user_to_ticket[uid]
+    if uid in tickets_to_user.values():
+        # find ticket_id by value
+        ticket_id = next(k for k, v in tickets_to_user.items() if v == uid)
         await forward_to_admin(ticket_id, text)
         return await message.reply("📨 Sent to admin.")
 
@@ -781,7 +1808,7 @@ async def handle_user_message(message: Message):
             ticket_id = await escalate_to_admin(uid, hist)
             return await message.reply(f"✅ Escalated to admin (ticket `{ticket_id}`).")
         except Exception:
-            logger.exception("Escalation failed")
+            logger.exception("Escalation failed for user %s", uid)
             return await message.reply("❌ Failed to escalate. Please try again later.")
 
     # 4) Debug echo
@@ -793,7 +1820,7 @@ async def handle_user_message(message: Message):
         try:
             reply = await call_yc(prompt)
         except Exception:
-            logger.exception("LLM call failed")
+            logger.exception("LLM call failed for user %s", uid)
             return await message.reply("❌ I'm having trouble right now.")
 
         # 6) Model-triggered escalation hint
@@ -804,7 +1831,7 @@ async def handle_user_message(message: Message):
                     f"✅ Model requested escalation (ticket `{ticket_id}`)."
                 )
             except Exception:
-                logger.exception("Escalation failed")
+                logger.exception("Escalation failed for user %s in model hint", uid)
                 return await message.reply(
                     "❌ Failed to escalate. Please try again later."
                 )
@@ -814,7 +1841,7 @@ async def handle_user_message(message: Message):
     await message.reply(reply)
 
 
-# ─── Flask: Health Check ────────────────────────────────────────────────────
+# ─── Flask: Health Check ───────────────────────────────────────────────────
 
 
 @app.route("/health", methods=["GET"])
@@ -829,16 +1856,16 @@ def health():
 def receive_claim():
     data = request.json or {}
     ticket_id = data.get("ticket_id")
-    if not ticket_id:
-        return jsonify(error="Missing ticket_id"), 400
+    user_id = data.get("user_id") or pending_ticket_to_user.get(ticket_id)
+    if not ticket_id or user_id is None:
+        return jsonify(error="Missing ticket_id or user_id"), 400
 
-    user_id = pending_ticket_to_user.get(ticket_id)
-    if not user_id:
-        return jsonify(error="Unknown ticket_id"), 404
-
-    user_to_ticket[user_id] = ticket_id
+    logger.info("Incoming /claim for ticket %s: user_id %s", ticket_id, user_id)
+    # clear any pending state
     pending_tickets.pop(user_id, None)
     pending_ticket_to_user.pop(ticket_id, None)
+    # mark claimed
+    tickets_to_user[ticket_id] = user_id
     return jsonify(status="claimed"), 200
 
 
@@ -853,24 +1880,25 @@ def receive_admin_reply():
     if not ticket_id or text is None:
         return jsonify(error="Missing ticket_id or text"), 400
 
-    user_id = user_to_ticket.get(ticket_id)
+    user_id = tickets_to_user.get(ticket_id)
     if not user_id:
         return jsonify(error="Unknown or unclaimed ticket"), 404
 
-    # If closing message, clear claim
-    if text.lower().startswith("🔒 ticket"):
-        user_to_ticket.pop(user_id, None)
-
-    # schedule send on polling loop
-    run_coroutine = asyncio.run_coroutine_threadsafe
-    run_coroutine(
-        bot.send_message(chat_id=user_id, text=f"👤 Admin: {text}"), polling_loop
-    )
+    logger.info("Incoming /reply for ticket %s: %r", ticket_id, text)
+    try:
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id=user_id, text=f"👤 Admin: {text}"), polling_loop
+        )
+    except Exception:
+        logger.exception(
+            "Failed to send message to user %s for ticket %s", user_id, ticket_id
+        )
+        return jsonify(error="Send failed"), 500
 
     return jsonify(status="sent"), 200
 
 
-# ─── Bootstrap: Run Flask + Telegram Polling ────────────────────────────────
+# ─── Bootstrap: Run Flask + Telegram Polling ─────────────────────────────────
 
 if __name__ == "__main__":
     # 1) Create & install asyncio loop
