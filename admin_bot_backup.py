@@ -478,11 +478,18 @@ async def cb_suspend(call: CallbackQuery):
         return await call.answer("❌ Not on that ticket.", show_alert=True)
     # suspend: clear current selection
     session["current"] = None
-    # remove buttons
+    # remove old buttons
     await call.message.edit_reply_markup()
+    # send a “resume” button so you can pick it right back up
+    resume_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Resume Ticket", callback_data="switch:list")]
+        ]
+    )
     await call.message.reply(
-        f"😴 *Ticket `{tid}` suspended.*\n\nUse 🔄 Switch to pick another ticket.",
+        f"😴 *Ticket `{tid}` suspended.*",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=resume_kb,
     )
     await call.answer("Suspended.")
 

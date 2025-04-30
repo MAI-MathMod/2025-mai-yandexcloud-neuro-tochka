@@ -1,6 +1,6 @@
-aiogram
-flask
-python-dotenv
-yandex-cloud-ml-sdk
-aiohttp
-python-jose
+aiohttp==3.8.5
+aiogram==3.1.1
+flask==2.3.3
+python-dotenv==1.0.0
+pyyaml==6.0.1
+yandex-cloud-ml-sdk==1.0.0
