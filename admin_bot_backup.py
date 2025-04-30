@@ -7,6 +7,7 @@ import signal
 import logging
 import sqlite3
 import uuid
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from aiogram.types import (
     CallbackQuery,
     BotCommand,
     BotCommandScopeDefault,
+    FSInputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -198,12 +200,49 @@ async def send_open_ticket_card(
     claim_btn = InlineKeyboardButton(text="🗂️ Claim", callback_data=f"claim:{ticket_id}")
     kb = InlineKeyboardMarkup(inline_keyboard=[nav_buttons, [claim_btn]])
 
-    if is_new:
-        await bot.send_message(
-            admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-        )
+    # Check if the message is too long (Telegram limit is around 4096 characters)
+    if len(text) > 3500:
+        # First send a short message with buttons
+        short_text = f"🆔 *{ticket_id}*  👤 `{info['user_id']}`\n\n*Conversation is attached as a file:*"
+        
+        # Create a temporary file for the conversation
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as temp_file:
+            temp_file.write(conv)
+            temp_path = temp_file.name
+        
+        try:
+            if is_new:
+                # Send message with buttons
+                await bot.send_message(
+                    admin_id, short_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+                )
+                # Send the conversation as a file
+                await bot.send_document(
+                    admin_id,
+                    FSInputFile(temp_path, filename=f"ticket_{ticket_id}_conversation.txt")
+                )
+            else:
+                # Edit the existing message with buttons
+                await edit_msg.edit_text(short_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                # Send the conversation as a file
+                await bot.send_document(
+                    admin_id,
+                    FSInputFile(temp_path, filename=f"ticket_{ticket_id}_conversation.txt")
+                )
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.error(f"Failed to delete temporary file {temp_path}: {e}")
     else:
-        await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        # Send as normal message if not too long
+        if is_new:
+            await bot.send_message(
+                admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+            )
+        else:
+            await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 async def send_claimed_ticket_card(admin_id: int, ticket_id: str, edit_msg=None):
@@ -225,12 +264,45 @@ async def send_claimed_ticket_card(admin_id: int, ticket_id: str, edit_msg=None)
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    if edit_msg:
-        await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    # Check if the message is too long (Telegram limit is around 4096 characters)
+    if len(text) > 3500:
+        # First send a short message with buttons
+        short_text = f"🎫 *Current Ticket:* `{ticket_id}`  👤 `{info['user_id']}`\n\n*Conversation is attached as a file:*"
+        
+        # Create a temporary file for the conversation
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as temp_file:
+            temp_file.write(conv)
+            temp_path = temp_file.name
+        
+        try:
+            if edit_msg:
+                # Edit the existing message with buttons
+                await edit_msg.edit_text(short_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            else:
+                # Send new message with buttons
+                await bot.send_message(
+                    admin_id, short_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+                )
+            
+            # Send the conversation as a file
+            await bot.send_document(
+                admin_id,
+                FSInputFile(temp_path, filename=f"ticket_{ticket_id}_conversation.txt")
+            )
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.error(f"Failed to delete temporary file {temp_path}: {e}")
     else:
-        await bot.send_message(
-            admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-        )
+        # Send as normal message if not too long
+        if edit_msg:
+            await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        else:
+            await bot.send_message(
+                admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+            )
 
 
 # ─── Aiogram Command Handlers ──────────────────────────────────────────────
@@ -480,7 +552,7 @@ async def cb_suspend(call: CallbackQuery):
     session["current"] = None
     # remove old buttons
     await call.message.edit_reply_markup()
-    # send a “resume” button so you can pick it right back up
+    # send a "resume" button so you can pick it right back up
     resume_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Resume Ticket", callback_data="switch:list")]
