@@ -7,8 +7,14 @@
 ## Команда
 
 | Имя | Роль | Контакт  |
-| --- | --- | --- |
-| Иван Иванов | Капитан | [@ii](https://t.me/ii) |
+
+| Сергей Мартынов | TeamLead| [@sergio0_1](https://t.me/sergio0_1)  |
+
+| Дмитрий Жидких | ML | [@kypluk4](https://t.me/kypluk4)  |
+
+| Белофастов Александр | Backend | [@the_real_shady](https://t.me/the_real_shady)  |
+
+| Миша Жаднов| Аналитик | [@miSh_Zh](https://t.me/miSh_Zh)  |
 
 ## Постановка задачи
 
