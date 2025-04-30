@@ -1,0 +1,9 @@
+pandas
+scikit-lear
+numpy
+yandex-cloud-ml-sdk
+ragas
+python-dotenv
+
+datasets
+tqdm
