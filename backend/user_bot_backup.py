@@ -314,7 +314,7 @@ async def build_user_context_message(user_id):
     This function retrieves a user's profile from the database and constructs a
     formatted message that provides context about the user to the language model.
     The context can include the user's name, a profile summary (AI-generated),
-    interests, and courses they're taking.
+    conversation summary, interests, and courses they're taking.
 
     Args:
         user_id (int): The Telegram user ID to retrieve profile information for
@@ -323,7 +323,7 @@ async def build_user_context_message(user_id):
         str or None: A formatted context message if user profile exists and contains
                      relevant information, otherwise None
 
-    The function prioritizes using the AI-generated profile summary if available,
+    The function prioritizes using the AI-generated summaries if available,
     but will fall back to using raw interests and courses if no summary exists.
     """
     try:
@@ -345,6 +345,11 @@ async def build_user_context_message(user_id):
                 context_parts.append(f"Interests: {user_profile.get('interests')}")
             if user_profile.get("courses"):
                 context_parts.append(f"Courses: {user_profile.get('courses')}")
+        
+        # Add conversation summary if available
+        conversation_summary = await get_conversation_summary(user_id)
+        if conversation_summary:
+            context_parts.append(f"Conversation summary: {conversation_summary}")
 
         if not context_parts:
             return None
@@ -660,6 +665,143 @@ async def summarize_profile_async(user_id: int, profile_text: str):
         logger.exception(
             f"[ERROR] Failed to generate profile summary for user {user_id}"
         )
+
+
+async def summarize_conversation_async(user_id: int, current_summary: str, latest_message: str):
+    """
+    Asynchronously update the conversation summary after receiving a new message.
+    
+    This function uses the YandexGPT model to incrementally update an existing conversation 
+    summary with new context from the latest message. If no current summary exists,
+    it creates a new one. The summary is stored in the database for future reference.
+    
+    Args:
+        user_id (int): The Telegram user ID whose conversation is being summarized
+        current_summary (str): The existing conversation summary (can be empty for new conversations)
+        latest_message (str): The new message to incorporate into the summary
+        
+    Returns:
+        str: The updated conversation summary if successful, otherwise None
+        
+    The function runs in the background without blocking the main conversation flow.
+    If running in DEBUG mode or if the summarizer assistant is not available,
+    this function will log a message and exit without performing summarization.
+    """
+    if DEBUG_MODE or not yandex_summarizer:
+        logger.info(
+            f"[CONV_SUMMARY] Skipping conversation summarization for user {user_id} - DEBUG or no summarizer"
+        )
+        return None
+    
+    await asyncio.sleep(1)  # Small delay to not impact main response time
+    
+    try:
+        summary_thread = sdk.threads.create(ttl_days=1, expiration_policy="static")
+        
+        if current_summary:
+            summary_prompt = f"Current summary: {current_summary}, User's latest message: {latest_message}"
+        else:
+            summary_prompt = f"User's latest message: {latest_message}"
+        
+        summary_thread.write(summary_prompt)
+        logger.info(
+            f"[CONV_SUMMARY] Requesting summary update for user {user_id}"
+        )
+        
+        run = yandex_summarizer.run(summary_thread)
+        res = run.wait()
+        
+        updated_summary = (res.text or "").strip()
+        
+        if updated_summary:
+            logger.info(f"[CONV_SUMMARY] Generated updated summary for user {user_id}")
+            
+            # Save to database
+            try:
+                success = await update_conversation_summary(user_id, updated_summary)
+                if success:
+                    logger.info(f"[CONV_SUMMARY] Saved conversation summary for user {user_id}")
+                else:
+                    logger.warning(f"[CONV_SUMMARY] Failed to save conversation summary for user {user_id}")
+            except Exception as e:
+                logger.exception(f"[ERROR] Error saving conversation summary for user {user_id}")
+                
+        try:
+            summary_thread.delete()
+        except Exception:
+            pass
+            
+        return updated_summary
+        
+    except Exception as e:
+        logger.exception(f"[ERROR] Failed to generate conversation summary for user {user_id}")
+        return None
+
+
+async def update_conversation_summary(user_id, conversation_summary):
+    """
+    Update the conversation summary field in a user's profile.
+    
+    Args:
+        user_id (int): The Telegram user ID to update the summary for
+        conversation_summary (str): The updated conversation summary
+        
+    Returns:
+        bool: True if the update succeeded, False otherwise
+    """
+    try:
+        async with get_db_connection() as db:
+            current_time = datetime.now().isoformat()
+            
+            try:
+                await db.execute(
+                    """
+                    UPDATE user_profiles 
+                    SET conversation_summary = ?, updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (conversation_summary, current_time, user_id),
+                )
+                await db.commit()
+                return True
+            except sqlite3.OperationalError as e:
+                logger.warning(f"[ERROR] Column error when updating conversation summary: {str(e)}")
+                # Column might not exist yet
+                return False
+                
+    except Exception as e:
+        logger.exception(f"[ERROR] Database error updating conversation summary for user {user_id}")
+        return False
+
+
+async def get_conversation_summary(user_id):
+    """
+    Retrieve a user's conversation summary from the database.
+    
+    Args:
+        user_id (int): The Telegram user ID to retrieve the summary for
+        
+    Returns:
+        str or None: The conversation summary if found, otherwise None
+    """
+    try:
+        async with get_db_connection() as db:
+            try:
+                async with db.execute(
+                    "SELECT conversation_summary FROM user_profiles WHERE user_id = ?",
+                    (user_id,),
+                ) as cursor:
+                    result = await cursor.fetchone()
+                    
+                if result and "conversation_summary" in result.keys():
+                    return result["conversation_summary"]
+                return None
+            except sqlite3.OperationalError:
+                # Column doesn't exist yet
+                return None
+    except Exception as e:
+        logger.exception(f"[ERROR] Database error getting conversation summary for user {user_id}")
+        return None
 
 
 async def update_profile_summary(user_id, profile_summary):
@@ -988,6 +1130,7 @@ async def setup_database():
             courses TEXT,
             agent_response TEXT,
             profile_summary TEXT,
+            conversation_summary TEXT,
             language TEXT,
             created_at TEXT,
             updated_at TEXT
@@ -1004,6 +1147,17 @@ async def setup_database():
             logger.info("Adding profile_summary column to user_profiles table")
             await db.execute(
                 "ALTER TABLE user_profiles ADD COLUMN profile_summary TEXT"
+            )
+
+        # Check if conversation_summary column exists, and add it if it doesn't
+        try:
+            # Try to select from conversation_summary column
+            await db.execute("SELECT conversation_summary FROM user_profiles LIMIT 1")
+        except sqlite3.OperationalError:
+            # If column doesn't exist, add it
+            logger.info("Adding conversation_summary column to user_profiles table")
+            await db.execute(
+                "ALTER TABLE user_profiles ADD COLUMN conversation_summary TEXT"
             )
 
         # Check if language column exists, and add it if it doesn't
@@ -2228,6 +2382,11 @@ async def handle_user_message(message: Message):
             parse_mode="Markdown",
         )
 
+    # Start the background conversation summarizer task
+    # This runs in parallel without blocking the rest of the conversation flow
+    current_summary = await get_conversation_summary(uid)
+    asyncio.create_task(summarize_conversation_async(uid, current_summary, text))
+    
     # 2) Escalated but not claimed → politely wait
     if uid in pending_tickets:
         logger.info(f"[TICKET] User {uid} has pending ticket {pending_tickets[uid]}")
@@ -3180,75 +3339,101 @@ async def handle_admin(message: Message):
 )
 async def handle_view_summaries(message: Message):
     """
-    Handle the /viewsummaries admin command to list all profile summaries.
+    Admin command to view all user profile summaries.
 
-    This function retrieves and displays AI-generated summaries of all user
-    profiles from the database. It's restricted to admin users only and
-    provides a comprehensive view of user profiles for administrative purposes.
+    This handler fetches all user profile summaries from the database and displays
+    them to the admin user in a formatted message. This is useful for monitoring
+    the quality of AI-generated summaries and understanding user demographics.
 
     Args:
-        message (Message): The Telegram message containing the /viewsummaries command
+        message (Message): The Telegram message containing the command
 
     Returns:
         None
 
-    The function handles long responses by splitting the output into multiple
-    messages if needed. It retrieves the 20 most recently updated profiles
-    with summaries.
+    Only users in the ADMIN_USER_IDS list can access this command.
     """
     try:
         async with get_db_connection() as db:
             async with db.execute(
                 """
-            SELECT user_id, name, profile_summary, updated_at
-            FROM user_profiles 
-            WHERE profile_summary IS NOT NULL AND profile_summary != ""
-            ORDER BY updated_at DESC
-            LIMIT 20
-            """
+                SELECT user_id, name, profile_summary
+                FROM user_profiles 
+                WHERE profile_summary IS NOT NULL AND profile_summary != ''
+                ORDER BY updated_at DESC
+                """
             ) as cursor:
-                profiles = await cursor.fetchall()
+                results = await cursor.fetchall()
 
-        if not profiles:
-            await message.reply(
-                "No profile summaries available yet.", parse_mode="Markdown"
-            )
-            return
+        if not results:
+            return await message.reply("📋 No profile summaries found.")
 
-        summaries_text = "*📊 User Profile Summaries*\n\n"
+        summaries = []
+        for row in results:
+            user_id = row["user_id"]
+            name = row["name"]
+            summary = row["profile_summary"]
+            summaries.append(f"👤 User: {user_id} ({name})\n{summary}\n")
 
-        for profile in profiles:
-            user_id, name, summary, updated_at = (
-                profile["user_id"],
-                profile["name"],
-                profile["profile_summary"],
-                profile["updated_at"],
-            )
-            summaries_text += f"*👤 User:* {name} (ID: {user_id})\n"
-            summaries_text += f"*Updated:* {updated_at}\n"
-            summaries_text += f"*Summary:* {summary}\n\n"
-
-            # Split message if it gets too long
-            if (
-                summaries_text
-                and summaries_text != "*📊 User Profile Summaries (continued)*\n\n"
-                and len(summaries_text) > 3500
-            ):
-                await message.reply(summaries_text, parse_mode="Markdown")
-                summaries_text = "*📊 User Profile Summaries (continued)*\n\n"
-
-        # Send remaining text
-        if (
-            summaries_text
-            and summaries_text != "*📊 User Profile Summaries (continued)*\n\n"
-        ):
-            await message.reply(summaries_text, parse_mode="Markdown")
+        # Split into multiple messages if needed
+        summary_text = "📋 *User Profile Summaries*\n\n" + "\n".join(summaries)
+        await send_split_message(message, summary_text, parse_mode="Markdown")
 
     except Exception as e:
-        logger.exception("Failed to retrieve profile summaries")
-        await message.reply(
-            "❌ Error retrieving profile summaries.", parse_mode="Markdown"
-        )
+        logger.exception("[ERROR] Failed to retrieve profile summaries")
+        await message.reply("❌ Error retrieving profile summaries")
+
+
+@dp.message(
+    lambda message: message.text
+    and message.text.strip().lower() == "/viewconvsummaries"
+    and message.from_user.id in ADMIN_USER_IDS
+)
+async def handle_view_conversation_summaries(message: Message):
+    """
+    Admin command to view all user conversation summaries.
+
+    This handler fetches all conversation summaries from the database and displays
+    them to the admin user in a formatted message. This is useful for monitoring
+    the quality of AI-generated conversation summaries and understanding user interactions.
+
+    Args:
+        message (Message): The Telegram message containing the command
+
+    Returns:
+        None
+
+    Only users in the ADMIN_USER_IDS list can access this command.
+    """
+    try:
+        async with get_db_connection() as db:
+            async with db.execute(
+                """
+                SELECT user_id, name, conversation_summary
+                FROM user_profiles 
+                WHERE conversation_summary IS NOT NULL AND conversation_summary != ''
+                ORDER BY updated_at DESC
+                """
+            ) as cursor:
+                results = await cursor.fetchall()
+
+        if not results:
+            return await message.reply("📋 No conversation summaries found.")
+
+        summaries = []
+        for row in results:
+            user_id = row["user_id"]
+            name = row.get("name", "Unknown")
+            summary = row["conversation_summary"]
+            summaries.append(f"👤 User: {user_id} ({name})\n{summary}\n")
+
+        # Split into multiple messages if needed
+        summary_text = "📋 *User Conversation Summaries*\n\n" + "\n".join(summaries)
+        await send_split_message(message, summary_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.exception("[ERROR] Failed to retrieve conversation summaries")
+        await message.reply("❌ Error retrieving conversation summaries")
 
 
 @dp.message(
