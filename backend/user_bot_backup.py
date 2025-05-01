@@ -422,9 +422,11 @@ async def call_yc(user_id: int, text: str) -> str:
 
     # Add instruction to focus on the current question
 
-    focused_text_ru = f"НОВЫЙ ВОПРОС (отвечай только на этот вопрос, не повторяй предыдущие ответы): {text}, ЕСЛИ НУЖНО, ПРИМЕНИ ПОИСК В ИНТЕРНЕТЕ"
-    focused_text_en = f"NEW QUESTION (answer only this question, do not repeat previous answers): {text}, IF NEEDED, USE SEARCH IN THE INTERNET"
-    focused_text_zh = f"新问题（仅回答此问题，不要重复之前的答案）：{text}，如有必要，请在互联网上搜索"
+    focused_text_ru = f"НОВЫЙ ВОПРОС (отвечай только на этот вопрос, не повторяй предыдущие ответы): {text}, ОБЯЗАТЕЛЬНО ПРИМЕНИ ПОИСК В ИНТЕРНЕТЕ"
+    focused_text_en = f"NEW QUESTION (answer only this question, do not repeat previous answers): {text}, ALWAYS USE SEARCH IN THE INTERNET"
+    focused_text_zh = (
+        f"新问题（仅回答此问题，不要重复之前的答案）：{text}，请在互联网上搜索"
+    )
     if lang == "ru":
         focused_text = focused_text_ru
     elif lang == "en":
