@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-RAG + Yandex Assistants API на базе Q&A приёмной комиссии МАИ
-============================================================
+RAG + Yandex Assistants API for MAI Admissions Q&A
+==================================================
 
-1. Читаем все JSON-файлы из папки filtered_qna и склеиваем пары Q&A
-   в один большой текст по каждой теме (чтобы файлов ≤ 100).
-2. Загружаем эти тексты в Yandex Cloud через sdk.files.upload_bytes.
-3. Создаём гибридный индекс (HybridSearchIndex) ― облако само
-   генерирует эмбеддинги, FAISS локально больше не нужен.
-4. Делаем search_tool = sdk.tools.search_index(index) и отдаём его
-   ассистенту. LLM сама вызывает поиск и использует найденный контекст.
-5. Консольный цикл: пользователь → thread → ассистент → ответ.
+This module implements a Retrieval-Augmented Generation system using Yandex Cloud's 
+Assistants API for handling Chinese language Q&A about Moscow Aviation Institute admissions.
 
-Требуется:
+Workflow:
+1. Read all JSON and Markdown files from the data_for_vectorize directory and
+   combine Q&A pairs into larger texts by topic (keeping file count ≤ 100).
+2. Upload these texts to Yandex Cloud using sdk.files.upload_bytes.
+3. Create a hybrid search index (HybridSearchIndex) - the cloud automatically
+   generates embeddings, eliminating the need for local FAISS.
+4. Create a search_tool using sdk.tools.search_index(index) and provide it to
+   the assistant. The LLM autonomously performs searches and utilizes the retrieved context.
+5. Console interaction loop: user → thread → assistant → response.
+
+Requirements:
     pip install --upgrade "yandex-cloud-ml-sdk>=0.3" tqdm
-Переменные окружения:
+Environment variables:
     YANDEX_FOLDER_ID, YANDEX_API_KEY
 """
 
-import os, json, uuid
+import os
+import json
+import uuid
 from pathlib import Path
+from typing import List, Tuple, Iterator, Optional, Any
+
 from yandex_cloud_ml_sdk import YCloudML
 from yandex_cloud_ml_sdk.search_indexes import (
     StaticIndexChunkingStrategy,
@@ -27,53 +35,58 @@ from yandex_cloud_ml_sdk.search_indexes import (
     ReciprocalRankFusionIndexCombinationStrategy,
 )
 from pydantic import BaseModel, Field
-import uuid
 import datetime as dt
 
-# ─── Константы ────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-FILTERED_DIR = SCRIPT_DIR.parent / "data_for_vectorize"
-ASSISTANT_NAME = "mai_admissions_chs_3"       # alias ассистента
-INDEX_NAME     = "mai_qna_index9"        # alias индекса
+SCRIPT_DIR: Path = Path(__file__).parent.resolve()
+FILTERED_DIR: Path = SCRIPT_DIR.parent / "data_for_vectorize"
+ASSISTANT_NAME: str = "mai_admissions_chs_3"  # Assistant alias
+INDEX_NAME: str = "mai_qna_index9"  # Index alias
 
-FOLDER_ID = "b1gst3c7cskk2big5fqn"  # ID папки в Yandex Cloud
-API_KEY   = "AQVNzzJielnSayrAOlQWlxDMK49OShvzdqtUQdAp"  # API-ключ
+FOLDER_ID: str = "b1gst3c7cskk2big5fqn"  # Yandex Cloud folder ID
+API_KEY: str = "AQVNzzJielnSayrAOlQWlxDMK49OShvzdqtUQdAp"  # API key
 if not FOLDER_ID or not API_KEY:
     raise RuntimeError(
-        "Введите экспорт YANDEX_FOLDER_ID и YANDEX_API_KEY в переменных окружения"
+        "Please set YANDEX_FOLDER_ID and YANDEX_API_KEY environment variables"
     )
 
 
 class SearchAndSumArgs(BaseModel):
     """
-    Параметры для функции поиска в интернете;
-    используется при недостаточности информации в локальном RAG.
+    Parameters for internet search function used when information 
+    in local RAG is insufficient.
 
     Attributes:
-        search_need (str): Текст поискового запроса для функции интернет-поиска.
+        search_need (str): Search query text for the internet search function.
     """
-    search_need: str = Field(..., description="Текст поискового запроса для Yandex Search")
+    search_need: str = Field(..., description="Search query text for Yandex Search")
 
 
 class EscalateTicket(BaseModel):
     """
-    Функция-утилита для создания тикета при эскалации запроса к оператору.
+    Utility function for creating a ticket when escalating a request to a human operator.
 
     Attributes:
-        reason (str): Причина эскалации, передаваемая оператору.
+        reason (str): Reason for escalation to be provided to the operator.
     """
-    reason:        str = Field(...,  description="Причина эскалации")
+    reason: str = Field(..., description="Reason for escalation")
 
-sdk = YCloudML(folder_id=FOLDER_ID, auth=API_KEY)
 
-# ─── 1. Читаем файлы и готовим текст по темам ──────────────────
-def _iter_topic_texts():
+# Initialize Yandex Cloud ML SDK
+sdk: YCloudML = YCloudML(folder_id=FOLDER_ID, auth=API_KEY)
+
+# ─── 1. Read files and prepare text by topics ──────────────────
+def _iter_topic_texts() -> Iterator[Tuple[str, str]]:
     """
-    Итератор по темам: читает JSON и Markdown и объединяет Q&A в один текст.
+    Iterator for topics: reads JSON and Markdown files and combines Q&A into a single text.
+
+    This function processes files in the FILTERED_DIR directory, extracting question-answer 
+    pairs from JSON files or using markdown content as-is, and combines them into
+    topic-specific text documents.
 
     Yields:
-        tuple[str, str]: (topic, big_text) — имя темы и объединённый текст.
+        Tuple[str, str]: (topic, big_text) - topic name and combined text.
     """
     for file in FILTERED_DIR.glob("*"):
         if file.suffix.lower() == ".json":
@@ -88,7 +101,7 @@ def _iter_topic_texts():
                 if not isinstance(qa, dict):
                     continue
                 q = (qa.get("question_text") or "").strip()
-                a = (qa.get("answer_text")   or "").strip()
+                a = (qa.get("answer_text") or "").strip()
                 if q and a:
                     lines.append(f"Q: {q}\nA: {a}\n")
             if lines:
@@ -100,20 +113,24 @@ def _iter_topic_texts():
             content = file.read_text(encoding="utf-8").strip()
             if content:
                 topic = file.stem
-                # Загружаем Markdown как есть, предваряя заголовком темы
+                # Load Markdown as-is, prefixing with topic header
                 big_text = "Тема: " + topic + "\n\n" + content
                 yield topic, big_text
 
 
-def prepare_files():
+def prepare_files() -> List[Any]:
     """
-    Загружает до 100 текстовых файлов в Яндекс Облако для индексации.
+    Uploads up to 100 text files to Yandex Cloud for indexing.
+
+    This function processes topic texts generated by _iter_topic_texts(),
+    uploads each text as a separate file to Yandex Cloud, and returns
+    the list of uploaded file objects.
 
     Returns:
-        list: Список объектов загруженных файлов Yandex Cloud.
+        List[Any]: List of uploaded Yandex Cloud file objects.
 
     Raises:
-        RuntimeError: Если нет валидных файлов или их больше 100.
+        RuntimeError: If no valid files are found or if there are more than 100 files.
     """
     files = []
     for topic, text in _iter_topic_texts():
@@ -126,21 +143,24 @@ def prepare_files():
         files.append(yfile)
 
     if not files:
-        raise RuntimeError("В папке data_for_vectorize нет валидных Q&A или MD-файлов")
+        raise RuntimeError("No valid Q&A or MD files found in data_for_vectorize directory")
     if len(files) > 100:
-        raise RuntimeError(f"Слишком много тем ({len(files)}). Лимит API — 100 файлов.")
+        raise RuntimeError(f"Too many topics ({len(files)}). API limit is 100 files.")
     return files
 
-# ─── 2. Индекс ────────────────────────────────────────────────
-def build_index(files):
+# ─── 2. Index ────────────────────────────────────────────────
+def build_index(files: List[Any]) -> Any:
     """
-    Создает HybridSearchIndex на основе загруженных файлов.
+    Creates a HybridSearchIndex based on uploaded files.
+
+    This function configures and initiates the creation of a hybrid search index
+    using the provided files, with specified chunking and combination strategies.
 
     Args:
-        files (list): Список объектов файлов Yandex Cloud.
+        files (List[Any]): List of Yandex Cloud file objects.
 
     Returns:
-        HybridSearchIndex: Готовый индекс после завершения операции.
+        Any: Completed index object after the operation finishes.
     """
     op = sdk.search_indexes.create_deferred(
         files,
@@ -155,12 +175,16 @@ def build_index(files):
     )
     return op.wait()
 
-def get_or_create_index():
+def get_or_create_index() -> Any:
     """
-    Поиск существующего индекса по имени или создание нового.
+    Finds an existing index by name or creates a new one.
+
+    This function checks if an index with the specified name already exists
+    in the Yandex Cloud. If found, it returns the existing index; otherwise,
+    it creates a new index by preparing files and building the index.
 
     Returns:
-        HybridSearchIndex: Найденный или вновь созданный индекс.
+        Any: Found or newly created index object.
     """
     z = []
     for idx in sdk.search_indexes.list():
@@ -168,21 +192,25 @@ def get_or_create_index():
             z.append(idx)
             print(idx)
     if z:
-        print(f"✔ Индекс найден: {z[-1].id}")
+        print(f"✔ Index found: {z[-1].id}")
         return z[-1]
-    print("◆ Индекс не найден — создаём заново…")
+    print("◆ Index not found - creating a new one...")
     return build_index(prepare_files())
 
-# ─── 3. Ассистент ─────────────────────────────────────────────
-def get_or_create_assistant(index):
+# ─── 3. Assistant ─────────────────────────────────────────────
+def get_or_create_assistant(index: Any) -> Any:
     """
-    Поиск или создание YandexGPT-ассистента с необходимыми инструментами.
+    Finds or creates a YandexGPT assistant with necessary tools.
+
+    This function checks if an assistant with the specified name already exists.
+    If found, it returns the existing assistant; otherwise, it creates a new
+    assistant configured with search index, escalation, and internet search tools.
 
     Args:
-        index: Объект HybridSearchIndex для поиска.
+        index (Any): HybridSearchIndex object for search.
 
     Returns:
-        Assistant: Настроенный ассистент YandexGPT.
+        Any: Configured YandexGPT assistant.
     """
     z = []
     for a in sdk.assistants.list():
@@ -190,9 +218,9 @@ def get_or_create_assistant(index):
             z.append(a)
             print(a)
     if z:
-        print(f"✔ Ассистент найден: {z[-1].id}")
+        print(f"✔ Assistant found: {z[-1].id}")
         return z[-1]
-    print("◆ Ассистент не найден — создаём заново…")
+    print("◆ Assistant not found - creating a new one...")
 
     search_tool = sdk.tools.search_index(index)
     escalate_tool = sdk.tools.function(EscalateTicket)
@@ -288,7 +316,7 @@ def get_or_create_assistant(index):
 
 当申请者请求联系管理员或接线员时：
 
-若申请者明确提出需要管理员或使用类似“找管理员”、“转接人工”、“需要客服”等词语时，立即调用escalate_tool功能
+若申请者明确提出需要管理员或使用类似"找管理员"、"转接人工"、"需要客服"等词语时，立即调用escalate_tool功能
 
 在调用时简要描述申请者的请求
 
@@ -316,7 +344,7 @@ def get_or_create_assistant(index):
 
 建议申请者与管理员确认
 
-使用类似“据我所知”、“根据现有资料”等表达方式
+使用类似"据我所知"、"根据现有资料"等表达方式
 
 使用学生体验信息时：
 
@@ -338,7 +366,7 @@ def get_or_create_assistant(index):
 
 使用文件中的准确表述
 
-明确注明信息来源（例如，“根据俄罗斯联邦政府决议……”）
+明确注明信息来源（例如，"根据俄罗斯联邦政府决议……"）
 
 必要时，用简单易懂的语言解释复杂术语
 
@@ -388,17 +416,21 @@ def get_or_create_assistant(index):
         tools=[search_tool, escalate_tool, internet_tool],
     )
 
-# ─── 4. Диалог ───────────────────────────────────────────────
-def chat_loop(assistant):
+# ─── 4. Dialogue ───────────────────────────────────────────────
+def chat_loop(assistant: Any) -> None:
     """
-    Запускает интерактивный цикл для общения с ассистентом через консоль.
+    Launches an interactive loop for communicating with the assistant through the console.
+
+    This function creates a thread for conversation, manages user input and assistant
+    responses, and handles the display of citations and answers. The loop continues
+    until the user enters 'exit', 'quit', or 'выход'.
 
     Args:
-        assistant: Объект ассистента, возвращаемый YCloudML.
+        assistant (Any): Assistant object returned by YCloudML.
     """
     thread = sdk.threads.create(ttl_days=7, expiration_policy="static")
     try:
-        print("Добро пожаловать! Введите вопрос, 'exit' — для выхода.")
+        print("Welcome! Enter your question, 'exit' to quit.")
         while True:
             q = input("?> ").strip()
             if q.lower() in {"exit", "quit", "выход"}:
@@ -414,12 +446,12 @@ def chat_loop(assistant):
                     print("------------------------")
                     print(source.parts[0])
 
-            print("\nОтвет:\n" + (res.text or "<пусто>").strip() + "\n")
+            print("\nAnswer:\n" + (res.text or "<empty>").strip() + "\n")
     finally:
         thread.delete()
 
 # ─── Main ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    index     = get_or_create_index()
+    index = get_or_create_index()
     assistant = get_or_create_assistant(index)
     chat_loop(assistant) 
