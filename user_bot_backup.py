@@ -53,10 +53,13 @@ ADMIN_BOT_MESSAGE_URL = os.getenv(
 YC_FOLDER_ID = os.getenv("YC_FOLDER_ID")
 YC_AUTH_TOKEN = os.getenv("YC_AUTH_TOKEN")
 YC_MODEL_NAME = os.getenv("YC_MODEL_NAME", "yandexgpt")
-ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "exam-assistant")
-ASSISTANT_NAME2 = os.getenv("ASSISTANT_NAME2", "mai_thread_summarizer1")
-INDEX_NAME = os.getenv("INDEX_NAME")
-
+ASSISTANT_NAME_RU = os.getenv("ASSISTANT_NAME_RU")
+ASSISTANT_NAME_EN = os.getenv("ASSISTANT_NAME_EN")
+ASSISTANT_NAME_ZH = os.getenv("ASSISTANT_NAME_ZH")
+ASSISTANT_NAME_SUM = os.getenv("ASSISTANT_NAME2", "mai_thread_summarizer1")
+INDEX_NAME_RU = os.getenv("INDEX_NAME_RU")
+INDEX_NAME_EN = os.getenv("INDEX_NAME_EN")
+INDEX_NAME_ZH = os.getenv("INDEX_NAME_ZH")
 
 # Debug echo‐mode toggle
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("1", "true", "yes")
@@ -230,7 +233,7 @@ def process_request_args(request_json: dict) -> str:
     return answer
 
 
-def get_or_create_index():
+def get_or_create_index(index_name):
     """
     Find existing search index or create a new one.
 
@@ -243,7 +246,7 @@ def get_or_create_index():
     """
     z = []
     for idx in sdk.search_indexes.list():
-        if idx.name == INDEX_NAME:
+        if idx.name == index_name:
             z.append(idx)
     if z:
         print(f"✔️ Индекс найден: {z[-1].id}")
@@ -251,7 +254,7 @@ def get_or_create_index():
     print("◆ Индекс не найден — создаём заново…")
 
 
-def get_or_create_assistant(index, assistant_name=ASSISTANT_NAME):
+def get_or_create_assistant(index, assistant_name):
     """
     Find existing assistant or create a new one with the specified name.
 
@@ -290,14 +293,15 @@ user_languages = {}  # user_id → "en"|"ru"|"zh" (English, Russian, Chinese)
 
 # Will hold our asyncio event loop
 polling_loop = None
-yandex_assistant = None
+yandex_assistant_ru = None
+yandex_assistant_en = None
+yandex_assistant_zh = None
 yandex_summarizer = None
 
 # ─── Flask & Aiogram Setup ─────────────────────────────────────────────────
 
 app = Flask(__name__)
 bot = Bot(token=USER_BOT_TOKEN)
-
 dp = Dispatcher()
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -502,8 +506,15 @@ async def call_yc(user_id: int, text: str) -> str:
         pass  # Skip thread history logging if it fails
 
     try:
-        run = yandex_assistant.run(thread)
-        res = run.wait()
+        if lang == "ru":
+            run = yandex_assistant_ru.run(thread)
+            res = run.wait()
+        elif lang == "en":
+            run = yandex_assistant_en.run(thread)
+            res = run.wait()
+        elif lang == "zh":
+            run = yandex_assistant_zh.run(thread)
+            res = run.wait()
 
         response = (res.text or "").strip()
 
@@ -3339,13 +3350,39 @@ if __name__ == "__main__":
     # Initialize Yandex Pro LLM assistant if not in debug mode
     if not DEBUG_MODE:
         try:
-            ind = get_or_create_index()
-            yandex_assistant = get_or_create_assistant(ind)
-            yandex_summarizer = get_or_create_assistant(0, ASSISTANT_NAME2)
+            ind_ru = get_or_create_index(INDEX_NAME_RU)
+            yandex_assistant_ru = get_or_create_assistant(ind_ru, ASSISTANT_NAME_RU)
+            yandex_summarizer = get_or_create_assistant(0, ASSISTANT_NAME_SUM)
+            ind_en = get_or_create_index(INDEX_NAME_EN)
+            yandex_assistant_en = get_or_create_assistant(ind_en, ASSISTANT_NAME_EN)
+            ind_zh = get_or_create_index(INDEX_NAME_ZH)
+            yandex_assistant_zh = get_or_create_assistant(ind_zh, ASSISTANT_NAME_ZH)
 
-            if yandex_assistant:
+            if yandex_assistant_ru:
                 logger.info(
-                    f"Successfully initialized Yandex Pro LLM assistant: {yandex_assistant.id}"
+                    f"Successfully initialized Yandex Pro LLM assistant: {yandex_assistant_ru.id}"
+                )
+            else:
+                logger.error(
+                    "Could not initialize Yandex Pro LLM assistant - returned None"
+                )
+                logger.warning("Falling back to DEBUG_MODE")
+                DEBUG_MODE = True
+
+            if yandex_assistant_en:
+                logger.info(
+                    f"Successfully initialized Yandex Pro LLM assistant: {yandex_assistant_en.id}"
+                )
+            else:
+                logger.error(
+                    "Could not initialize Yandex Pro LLM assistant - returned None"
+                )
+                logger.warning("Falling back to DEBUG_MODE")
+                DEBUG_MODE = True
+
+            if yandex_assistant_zh:
+                logger.info(
+                    f"Successfully initialized Yandex Pro LLM assistant: {yandex_assistant_zh.id}"
                 )
             else:
                 logger.error(
