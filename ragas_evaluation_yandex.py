@@ -8,7 +8,9 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 import time
 
-
+lang = "ru"
+# lang = "en"
+# lang = "chs"
 load_dotenv()
 
 class YandexRAGEvaluator:
@@ -46,11 +48,11 @@ class YandexRAGEvaluator:
             # Создаем новый thread для каждого теста
             thread = self.sdk.threads.create(ttl_days=1, expiration_policy="static")
             try:
-                print(f"\nОбработка вопроса: {item['question'][:50]}...")
+                print(f"\nОбработка вопроса: {item['question']}")
                 
                 # Отправляем вопрос
                 print("Отправка вопроса...")
-                thread.write(item["question"])
+                thread.write(item["context"])
                 
                 # Запускаем ассистента
                 print("Запуск ассистента...")
@@ -73,6 +75,7 @@ class YandexRAGEvaluator:
                 # Получаем ответ
                 answer = response.text.strip()
                 print(f"Получен ответ длиной {len(answer)} символов")
+                print(f"Ответ: {answer}")
                 
                 # Оцениваем метрики
                 print("Оценка faithfulness...")
@@ -191,7 +194,7 @@ class YandexRAGEvaluator:
 def main():
     # Загрузка тестовых данных
     test_data = []
-    data_dir = Path("data_for_vectorize")
+    data_dir = Path(f'data_for_ragas_test/{lang}')
     
     print(f"Ищем файлы в директории: {data_dir.absolute()}")
     if not data_dir.exists():

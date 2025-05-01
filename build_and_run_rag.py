@@ -31,12 +31,18 @@ import uuid
 import datetime as dt
 
 # ─── Константы ────────────────────────────────────────────────
+# ru
+# FILTERED_DIR   = Path("parsed_data")   # каталог с JSON
+# ASSISTANT_NAME = "mai_admissions10"       # alias ассистента
+# INDEX_NAME     = "mai_qna_index9"
+# en
+# FILTERED_DIR   = Path("parsed_data")   # каталог с JSON
+# ASSISTANT_NAME = "mai_admissions_en_3"       # alias ассистента
+# INDEX_NAME     = "mai_qna_index9"      # alias индекса
+# ch
 FILTERED_DIR   = Path("parsed_data")   # каталог с JSON
-ASSISTANT_NAME = "test_mai_admissions8"       # alias ассистента
-INDEX_NAME     = "test_mai_qna_index8"        # alias индекса
-# FILTERED_DIR   = Path("data_for_vectorize")   # каталог с JSON
-# ASSISTANT_NAME = "mai_admissions6"       # alias ассистента
-# INDEX_NAME     = "mai_qna_index6"        # alias индекса
+ASSISTANT_NAME = "mai_admissions_chs_3"       # alias ассистента
+INDEX_NAME     = "mai_qna_index9"       # alias индекса
 
 FOLDER_ID = "b1gst3c7cskk2big5fqn"  # ID папки в Yandex Cloud
 API_KEY   = "AQVNzzJielnSayrAOlQWlxDMK49OShvzdqtUQdAp"  # API-ключ
@@ -197,10 +203,10 @@ def get_or_create_assistant(index):
     • Будьте кратки, но точны; при необходимости добавляйте пункты, списки, ссылки на документы (как они названы в Базе).
     • Не раскрывайте внутреннюю логику поиска.
 5.	Примеры
-    ✅ Данные найдены
+    Данные найдены
     Вопрос: «Какие льготы есть у призёров Всероса?»
     Ответ: «Согласно разделу 3, пункту 2 «Правил приёма-2025» (База, doc-ID #A-34), призёры и победители заключительного этапа Всероссийской олимпиады поступают без вступительных испытаний…»
-    ⛔ Данных нет → ticket
+    Данных нет → ticket
     Вопрос: «Сколько бюджетных мест на “Космические системы” в 2030 г.?»
     Действие:
     – Сообщите пользователю: «К сожалению, в Базе ещё нет информации о приёмной кампании 2030 года.»

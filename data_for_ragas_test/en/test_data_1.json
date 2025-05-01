@@ -1,0 +1,89 @@
+{
+    "qa_pairs": [
+        {
+            "question": "Who is Mikhail Aslanovich Pogosyan?",
+            "context": "Mikhail Aslanovich Pogosyan is the rector of MAI, the main person in the entire university. Please answer in English.",
+            "ground_truth": "Mikhail Aslanovich Pogosyan is the rector of MAI, a Russian aircraft designer and entrepreneur, academician of the Russian Academy of Sciences (2011), Doctor of Technical Sciences."
+        },
+        {
+            "question": "Is lunch free?",
+            "context": "There is no free food anywhere. Please answer in English.",
+            "ground_truth": "MAI does not provide free meals for students, but there is an opportunity to purchase food in the cafeteria at a reasonable price."
+        },
+        {
+            "question": "Where should I enroll to not regret it?",
+            "context": "It's better to enroll in a program related to subjects you enjoyed in school. Please answer in English.",
+            "ground_truth": "For the right choice of direction at MAI, it is recommended to: 1. Assess your interests and inclinations towards technical sciences (physics, mathematics, computer science). 2. Study the training programs at different MAI faculties. 3. Visit open house days. 4. Talk to students of chosen directions. 5. Contact the admissions committee for consultation."
+        },
+        {
+            "question": "How does admission to MAI work after college?",
+            "context": "MAI accepts college graduates for various specialties. For admission, it is necessary to pass internal entrance exams or provide USE results. Please answer in English.",
+            "ground_truth": "Admission to MAI after college: 1. Internal exams are held in July. 2. Registration through the MAI applicant's personal account. 3. All specialties corresponding to the college profile are available. 4. Exams are conducted in a distance format. 5. USE can be skipped if taking internal exams."
+        },
+        {
+            "question": "Are there internal exams?",
+            "context": "For admission to MAI, it is necessary to pass internal entrance exams or provide USE results. Please answer in English.",
+            "ground_truth": "Yes, MAI conducts internal exams."
+        },
+        {
+            "question": "When are they written?",
+            "context": "MAI accepts college graduates for various specialties. For admission, it is necessary to pass internal entrance exams or provide USE results. Please answer in English.",
+            "ground_truth": "Admission to MAI after college: 1. Internal exams are held in July. 2. Registration through the MAI applicant's personal account. 3. All specialties corresponding to the college profile are available. 4. Exams are conducted in a distance format. 5. USE can be skipped if taking internal exams. 6. Attendance system: mandatory attendance of lectures and practical classes, exam admission with at least 80% attendance."
+        },
+        {
+            "question": "How to register for them?",
+            "context": "Registration for internal exams is conducted through the MAI applicant's personal account. Please answer in English.",
+            "ground_truth": "Registration for internal exams is conducted through the MAI applicant's personal account."
+        },
+        {
+            "question": "What specialties can I enroll in after college at MAI?",
+            "context": "MAI accepts college graduates for various specialties. Please answer in English.",
+            "ground_truth": "After college at MAI, you can enroll in the following areas of study: Applied Mathematics, Fundamental Computer Science and Information Technology, Computer Science and Computer Engineering, Software Engineering, Radio Engineering, Information and Communication Technologies and Communication Systems, Design and Technology of Electronic Means, Instrument Engineering, Heat Power Engineering and Heat Engineering, Technosphere Safety, Materials Science and Materials Technology, Metallurgy, Rocket Systems and Astronautics, Ballistics and Hydroaerodynamics, Aircraft Construction, Aircraft Engines, Technical Operation of Aircraft and Engines, Standardization and Metrology, Quality Management, System Analysis and Management, Control in Technical Systems, Innovation, Economics, Management, Advertising and Public Relations."
+        },
+        {
+            "question": "In what format are internal exams conducted?",
+            "context": "For admission, it is necessary to pass internal entrance exams or provide USE results. Please answer in English.",
+            "ground_truth": "Internal exams are conducted in a distance format in July."
+        },
+        {
+            "question": "Do I need to take the USE?",
+            "context": "For admission, it is necessary to pass internal entrance exams or provide USE results. Please answer in English.",
+            "ground_truth": "USE can be skipped if taking internal exams."
+        },
+        {
+            "question": "What is the attendance system at MAI?",
+            "context": "MAI attendance system: mandatory attendance of lectures and practical classes, exam admission with at least 80% attendance. Please answer in English.",
+            "ground_truth": "MAI attendance system: mandatory attendance of lectures and practical classes, exam admission with at least 80% attendance."
+        },
+        {
+            "question": "If my husband studies at MAI, will there be a family scholarship?",
+            "ground_truth": "Family scholarship is not provided at MAI. Students can only receive academic or social scholarships on general terms.",
+            "context": "Family scholarship is not provided at MAI. Please answer in English."
+        },
+        {
+            "question": "How are the dormitories?",
+            "context": "MAI has several dormitories for students. Please answer in English.",
+            "ground_truth": "MAI provides dormitory places for non-resident students. Dormitories are located within walking distance from academic buildings. Living conditions are comfortable. But this comfort depends on USE scores or internal exam results."
+        },
+        {
+            "question": "Is the teaching good?",
+            "context": "MAI has a highly qualified teaching staff and modern material and technical base. Please answer in English.",
+            "ground_truth": "MAI is one of the leading technical universities in Russia with a high level of teaching. Classes are conducted by experienced teachers, many of whom are active specialists in the aviation and space industry."
+        },
+        {
+            "question": "How many classes per day?",
+            "context": "The class schedule is formed taking into account the specifics of each area of study. Please answer in English.",
+            "ground_truth": "The class schedule depends on the course and specialty, usually 2-3 classes per day."
+        },
+        {
+            "question": "Is it difficult to combine work and study?",
+            "context": "The university provides opportunities for combining study and work. Please answer in English.",
+            "ground_truth": "Combining work and study requires proper time and effort planning, as the subjects studied at the university are very complex and require a lot of time and effort to learn. Many MAI students successfully combine work with study, however, this may require additional effort and self-discipline."
+        },
+        {
+            "question": "What is the minimum score needed for admission to faculty 8?",
+            "context": "Faculty 8 of MAI is one of the most popular, so the competition is very high. Please answer in English.",
+            "ground_truth": "Minimum scores for admission to faculty 8 average 220-280 points for three USE subjects. Specific passing scores may vary depending on the competition and number of applications."
+        }
+    ]
+} 
