@@ -3,10 +3,14 @@ import asyncio
 import logging
 import threading
 import signal
+import requests
 import aiohttp
 import json
 import csv
 import io
+import re
+import time
+import base64
 import sqlite3
 from datetime import datetime
 import aiosqlite
@@ -53,6 +57,7 @@ ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "exam-assistant")
 ASSISTANT_NAME2 = os.getenv("ASSISTANT_NAME2", "mai_thread_summarizer1")
 INDEX_NAME = os.getenv("INDEX_NAME")
 
+
 # Debug echo‐mode toggle
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("1", "true", "yes")
 print(DEBUG_MODE)
@@ -80,60 +85,162 @@ if not DEBUG_MODE:
     sdk.setup_default_logging(log_level="DEBUG")
 
 
-# --- Вспомогательные функции для внешнего поиска ---
 def clean_html(text: str) -> str:
-    return re.sub(r'<[^>]+>', '', text)
+    """
+    Remove all <...> tags from a string and return clean text.
+    """
+    return re.sub(r"<[^>]+>", "", text)
 
 
-def perform_yandex_search(query_body: dict, poll_interval: int = 5, timeout: int = 600) -> str:
-    headers = {'Authorization': f'Bearer {IAM_TOKEN}', 'Content-Type': 'application/json'}
-    resp = sdk._http.post(
-        'https://searchapi.api.cloud.yandex.net/v2/web/searchAsync',
-        headers=headers, json=query_body
+def perform_yandex_search(
+    query_body: dict, poll_interval: int = 5, timeout: int = 600
+) -> str:
+    """
+    Perform an asynchronous web search using Yandex Search API and retrieve the raw results.
+    
+    This function submits a search query to the Yandex Search API's asynchronous endpoint,
+    polls for completion of the search operation at specified intervals, and retrieves
+    the Base64-encoded response once complete. The response is then decoded and returned
+    as a UTF-8 string.
+    
+    The function implements a long-polling pattern with timeout protection to handle
+    the asynchronous nature of the Yandex Search API. It uses bearer token authentication
+    through the YC_AUTH_TOKEN environment variable.
+    
+    Parameters:
+        query_body (dict): The search query and parameters formatted as a JSON-serializable
+                          dictionary according to Yandex Search API specifications.
+        poll_interval (int, optional): Time in seconds between polling requests to check
+                                      operation status. Default is 5 seconds.
+        timeout (int, optional): Maximum time in seconds to wait for the search operation
+                               to complete before raising a TimeoutError. Default is 600 seconds.
+    
+    Returns:
+        str: The decoded search results as a UTF-8 string.
+    
+    Raises:
+        requests.exceptions.HTTPError: If any API request fails.
+        TimeoutError: If the search operation does not complete within the specified timeout.
+        Exception: For other potential errors in the requests or data processing.
+    
+    API Endpoints Used:
+        - POST https://searchapi.api.cloud.yandex.net/v2/web/searchAsync - To initiate search
+        - GET https://operation.api.cloud.yandex.net/operations/{id} - To check status
+    
+    Note:
+        This function requires the YC_AUTH_TOKEN environment variable to be set with
+        a valid Yandex Cloud API token with appropriate permissions.
+    """
+    headers = {
+        "Authorization": f"Bearer {YC_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    # Launch async search
+    resp = requests.post(
+        "https://searchapi.api.cloud.yandex.net/v2/web/searchAsync",
+        headers=headers,
+        json=query_body,
     )
     resp.raise_for_status()
-    op_id = resp.json()['id']
-    op_url = f'https://operation.api.cloud.yandex.net/operations/{op_id}'
+    operation_id = resp.json().get("id")
+
+    # Poll for completion
+    op_url = f"https://operation.api.cloud.yandex.net/operations/{operation_id}"
     start = time.time()
     while True:
-        op_resp = sdk._http.get(op_url, headers={'Authorization': f'Bearer {IAM_TOKEN}'})
+        op_resp = requests.get(
+            op_url, headers={"Authorization": f"Bearer {YC_AUTH_TOKEN}"}
+        )
         op_resp.raise_for_status()
-        data = op_resp.json()
-        if data.get('done'): break
+        op_data = op_resp.json()
+        if op_data.get("done"):
+            break
         if time.time() - start > timeout:
-            raise TimeoutError("Yandex search timed out")
+            raise TimeoutError("Yandex search operation timed out.")
         time.sleep(poll_interval)
-    raw_b64 = data['response']['rawData']
-    return base64.b64decode(raw_b64).decode('utf-8', errors='ignore')
+
+    # Extract and decode Base64 rawData
+    raw_base64 = op_data["response"]["rawData"]
+    decoded = base64.b64decode(raw_base64).decode("utf-8", errors="ignore")
+    return decoded
 
 
 def call_yandexgpt(search_need: str, content: str) -> str:
+    """
+    Call Yandex GPT model with the search query and the search result content.
+    Returns the structured answer text.
+    """
     prompt = (
         f"Запрос для поиска: {search_need}\n"
         f"Собранные данные:\n{content}\n"
-        "Пожалуйста, обработай данные и выдай структурированный ответ."
+        "Пожалуйста, обработай данные и выдай структурированный ответ на вопрос."
     )
     model = sdk.models.completions("yandexgpt", model_version="rc")
-    return model.run(prompt).text
+    completion = model.run(prompt)
+    return completion.text
 
 
-def process_request_args(search_need: str) -> dict:
-    # Строим тело запроса
-    body = {
-        "query": {"searchType":"SEARCH_TYPE_RU","queryText":search_need,
-                  "familyMode":"FAMILY_MODE_MODERATE","page":0,"fixTypoMode":"FIX_TYPO_MODE_ON"},
-        "sortSpec": {"sortMode":"SORT_MODE_BY_RELEVANCE","sortOrder":"SORT_ORDER_DESC"},
-        "groupSpec": {"groupMode":"GROUP_MODE_DEEP","groupsOnPage":20,"docsInGroup":1},
-        "maxPassages":4,"region":"213","l10N":"LOCALIZATION_RU",
-        "folderId":FOLDER_ID,"responseFormat":"FORMAT_XML","userAgent":"CLI"
+def process_request_args(request_json: dict) -> str:
+    """
+    Main entrypoint function.
+    Expects JSON with keys:
+      - func_name: str
+      - search_need: str
+
+    Returns a dict with func_name and generated answer.
+    """
+    func_name = "SearchAndSumArgs"
+    search_need = request_json["search_need"]
+    if not func_name or not search_need:
+        raise ValueError("Request JSON must include 'func_name' and 'search_need'.")
+
+    # Build Yandex Search API body
+    query_body = {
+        "query": {
+            "searchType": "SEARCH_TYPE_RU",
+            "queryText": search_need,
+            "familyMode": "FAMILY_MODE_MODERATE",
+            "page": 0,
+            "fixTypoMode": "FIX_TYPO_MODE_ON",
+        },
+        "sortSpec": {
+            "sortMode": "SORT_MODE_BY_RELEVANCE",
+            "sortOrder": "SORT_ORDER_DESC",
+        },
+        "groupSpec": {
+            "groupMode": "GROUP_MODE_DEEP",
+            "groupsOnPage": 7,
+            "docsInGroup": 1,
+        },
+        "maxPassages": 4,
+        "region": "213",
+        "l10N": "LOCALIZATION_RU",
+        "folderId": YC_FOLDER_ID,
+        "responseFormat": "FORMAT_XML",
+        "userAgent": "Mozilla/5.0",
     }
-    raw = perform_yandex_search(body)
-    clean = clean_html(raw)
-    answer = call_yandexgpt(search_need, clean)
-    return {"answer": answer}
+
+    # 1. Perform search and get raw HTML/XML
+    raw_response = perform_yandex_search(query_body)
+    # 2. Clean HTML/XML tags
+    clean_text = clean_html(raw_response)
+    # 3. Call YandexGPT for structured answer
+    answer = call_yandexgpt(search_need, clean_text)
+
+    return answer
 
 
 def get_or_create_index():
+    """
+    Find existing search index or create a new one.
+    
+    This function searches through the available Yandex Cloud search indexes to
+    find one matching the configured INDEX_NAME. It returns the found index, or
+    creates a new one if no matching index is found.
+    
+    Returns:
+        object: The search index object that matches INDEX_NAME
+    """
     z = []
     for idx in sdk.search_indexes.list():
         if idx.name == INDEX_NAME:
@@ -145,7 +252,21 @@ def get_or_create_index():
 
 
 def get_or_create_assistant(index, assistant_name=ASSISTANT_NAME):
-    """Get or create an assistant with the specified name"""
+    """
+    Find existing assistant or create a new one with the specified name.
+    
+    This function searches through the available Yandex Cloud assistants to find
+    one matching the specified assistant_name. It returns the found assistant, or
+    potentially creates a new one if no matching assistant is found.
+    
+    Args:
+        index: The search index to associate with the assistant
+        assistant_name (str, optional): Name of the assistant to find. 
+                                        Defaults to ASSISTANT_NAME.
+    
+    Returns:
+        object: The assistant object that matches the requested name
+    """
     z = []
     for a in sdk.assistants.list():
         if a.name == assistant_name:
@@ -237,23 +358,23 @@ async def build_user_context_message(user_id):
 async def call_yc(user_id: int, text: str) -> str:
     """
     Process user messages through the Yandex Cloud LLM with threads and assistants.
-    
+
     This function is the core interaction point with the Yandex Cloud ML model. It:
     1. Manages thread creation and message history
     2. Adds user profile context to enhance personalization
     3. Implements retry logic for resilience against API errors
     4. Handles thread locking issues by creating new threads when needed
     5. Processes responses and detects escalation signals
-    
+
     Args:
         user_id (int): The Telegram user ID sending the message
         text (str): The message content from the user
-        
+
     Returns:
         tuple: (response_text, escalate_flag) where:
             - response_text (str): The model's response text
             - escalate_flag (bool): True if the model indicated this should be escalated to a human
-            
+
     The function implements extensive error handling and logging, capturing the complete
     context, input and response for debugging purposes. In debug mode, it will simply
     echo back the input text.
@@ -267,7 +388,7 @@ async def call_yc(user_id: int, text: str) -> str:
     if not thread:
         thread = sdk.threads.create(ttl_days=7, expiration_policy="static")
         user_threads[user_id] = thread
-        
+
         context_message = await build_user_context_message(user_id)
         if context_message:
             try:
@@ -293,10 +414,10 @@ async def call_yc(user_id: int, text: str) -> str:
 
     max_retries = 3
     retry_delay = 2  # seconds
-    
+
     # Add instruction to focus on the current question
     focused_text = f"НОВЫЙ ВОПРОС (отвечай только на этот вопрос, не повторяй предыдущие ответы): {text}"
-    
+
     for attempt in range(max_retries):
         try:
             # Write user message to thread with the focus instruction
@@ -311,7 +432,7 @@ async def call_yc(user_id: int, text: str) -> str:
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
                 continue
-            
+
             if attempt == max_retries - 1:
                 logger.warning(
                     f"Creating new thread for user {user_id} after failed attempts"
@@ -319,7 +440,7 @@ async def call_yc(user_id: int, text: str) -> str:
                 try:
                     thread = sdk.threads.create(ttl_days=7, expiration_policy="static")
                     user_threads[user_id] = thread
-                    
+
                     context_message = await build_user_context_message(user_id)
                     if context_message:
                         try:
@@ -339,7 +460,7 @@ async def call_yc(user_id: int, text: str) -> str:
                                 logger.exception(
                                     f"[ERROR] Error adding profile context to new thread"
                                 )
-                    
+
                     # Write the original message with focus instruction to new thread
                     thread.write(focused_text)
                     logger.info(f"[REQUEST] User {user_id}: '{text}' (new thread)")
@@ -369,31 +490,43 @@ async def call_yc(user_id: int, text: str) -> str:
             )
     except Exception:
         pass  # Skip thread history logging if it fails
-    
+
     try:
         run = yandex_assistant.run(thread)
         res = run.wait()
-        
+
         response = (res.text or "").strip()
-        
+
         # Log the full model response
         logger.info(f"[RESPONSE] For user {user_id}, model returned:\n{response}")
-        
+
         if res.tool_calls:
+            result = []
             for i in res.tool_calls:
                 if i.function.name == "EscalateTicket":
                     escalate_flag = True
                     logger.info(
                         f"[ESCALATE] Model triggered escalation for user {user_id}"
                     )
+                    break
                 elif i.function.name == "SearchAndSumArgs":
+                    x = process_request_args(i.function.arguments)
+                    result.append({"name": i.function.name, "content": x})
+                    logger.info(
+                        f"[SearchAndSumArgs] Model triggered search for user {user_id}\n"
+                        + f"[SearchAndSumArgs] {run}"
+                    )
+                    print(result)
+            run.submit_tool_results(result)
+            time.sleep(3)
+            res = run.wait()
+            response = (res.text or "").strip()
 
-        
         if res.citations:
             logger.info(
                 f"[CITATIONS] Response for user {user_id} includes citations: {res.citations}"
             )
-            
+
         return response, escalate_flag
     except Exception as e:
         logger.exception(f"[ERROR] Error running assistant for user {user_id}")
@@ -646,16 +779,16 @@ async def forward_to_admin(ticket_id: str, text: str):
 async def fetch_scores():
     """
     Fetch exam scores from a Google Sheet using the public CSV export feature.
-    
+
     This function retrieves student exam scores from a Google Spreadsheet,
     processes the CSV data, and returns a structured representation of the scores.
     The scores are sorted in descending order by value.
-    
+
     Returns:
         dict: A dictionary containing either:
             - {"items": [{"name": "СНИЛС: xxx", "score": 123}, ...]} for successful requests
             - {"error": "error message"} if there was an issue fetching or processing the data
-            
+
     The function extracts the sheet ID from the URL defined in GOOGLE_SHEETS_URL
     environment variable and constructs a CSV export URL to fetch the data.
     """
@@ -713,7 +846,41 @@ db_pool = {}  # Connection pool
 
 
 class DatabaseConnectionManager:
-    """Manager for database connections to handle concurrent access"""
+    """
+    A connection pool manager for SQLite database access in an asynchronous environment.
+    
+    This class provides a task-based connection pooling mechanism to manage SQLite 
+    database connections efficiently while ensuring thread safety in an async context.
+    It maintains a dictionary of database connections keyed by task ID to allow 
+    different async tasks to use separate connections without interference.
+    
+    The manager implements a connection-per-task pattern, where each async task 
+    receives its own dedicated database connection. This approach prevents connection 
+    sharing issues in the async environment while allowing connection reuse within 
+    the same task.
+    
+    Features:
+    - Task-local connection management to prevent concurrency issues
+    - Automatic connection creation on first access by a task
+    - Connection pooling to avoid excessive connection creation/destruction
+    - Thread-safe access through asyncio locks
+    - Complete connection cleanup capability
+    
+    The connection manager is designed to work with the aiosqlite library and 
+    SQLite databases. It's particularly useful in a Telegram bot application where 
+    multiple async handlers might need database access concurrently.
+    
+    Usage Example:
+        db_manager = DatabaseConnectionManager()
+        
+        async def some_task():
+            conn = await db_manager.get_connection()
+            await conn.execute(...)
+            await conn.commit()
+    
+    Note: Most application code should use the get_db_connection() context manager 
+    instead of accessing this class directly.
+    """
 
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -823,16 +990,20 @@ async def setup_database():
         except sqlite3.OperationalError:
             # If column doesn't exist, add it
             logger.info("Adding language column to user_profiles table")
-            await db.execute(
-                "ALTER TABLE user_profiles ADD COLUMN language TEXT"
-            )
+            await db.execute("ALTER TABLE user_profiles ADD COLUMN language TEXT")
 
         await db.commit()
     logger.info("Database initialized successfully")
 
 
 async def save_user_profile(
-    user_id, name, interests, courses, agent_response="", profile_summary=None, language=None
+    user_id,
+    name,
+    interests,
+    courses,
+    agent_response="",
+    profile_summary=None,
+    language=None,
 ):
     """
     Save or update a user's profile in the database.
@@ -975,9 +1146,7 @@ async def get_user_profile(user_id):
                         else None
                     ),
                     "language": (
-                        result["language"]
-                        if "language" in result.keys()
-                        else None
+                        result["language"] if "language" in result.keys() else None
                     ),
                 }
             return None
@@ -1044,26 +1213,26 @@ async def handle_start(message: Message):
 async def process_language_selection(callback_query: CallbackQuery):
     """
     Handle language selection from the buttons shown in the /start command.
-    
+
     This function processes the user's language selection, stores it in both memory
     and database, and then continues with the regular profile creation flow by
     asking for the user's name.
-    
+
     Args:
         callback_query (CallbackQuery): The callback query from button selection
-        
+
     Returns:
         None
     """
     uid = callback_query.from_user.id
     language_code = callback_query.data.split("_")[1]  # Get "en", "ru", or "zh"
-    
+
     # Store language preference in memory
     user_languages[uid] = language_code
-    
+
     # Update user state to proceed with name collection
     user_states[uid] = {"state": "waiting_for_name", "data": {}}
-    
+
     # Prepare welcome message in selected language
     if language_code == "zh":
         welcome_message = "谢谢！请告诉我您的名字："
@@ -1071,13 +1240,13 @@ async def process_language_selection(callback_query: CallbackQuery):
         welcome_message = "Спасибо! Пожалуйста, скажите мне, как вас зовут:"
     else:  # Default to English
         welcome_message = "Thank you! Please tell me your name:"
-    
+
     # Log language selection
     logger.info(f"[LANGUAGE] User {uid} selected language: {language_code}")
-    
+
     # Update the message to remove buttons and show the next question
     await callback_query.message.edit_text(welcome_message)
-    
+
     # Acknowledge the callback query
     await callback_query.answer()
 
@@ -1140,14 +1309,14 @@ async def handle_help(message: Message):
 async def handle_view_scores(message: Message):
     """
     Handle the /viewscores command to display current exam scores.
-    
+
     This function fetches and displays the current exam scores from a Google Sheet.
     It presents the scores in a formatted message and provides a refresh button
     to allow users to get updated scores.
-    
+
     Args:
         message (Message): The Telegram message containing the /viewscores command
-        
+
     Returns:
         None
     """
@@ -1218,14 +1387,14 @@ async def handle_subscribe(message: Message):
 async def handle_check_score(message: Message):
     """
     Handle the /checkscore command to check potential ranking position.
-    
+
     This function allows users to check where they would rank in the current
     exam standings based on a score. It presents a set of score range buttons
     for quick selection as well as an option to enter a custom score.
-    
+
     Args:
         message (Message): The Telegram message containing the /checkscore command
-        
+
     Returns:
         None
     """
@@ -1327,7 +1496,44 @@ async def handle_update_profile(message: Message):
 
 @dp.callback_query(lambda c: c.data == "refresh_scores")
 async def process_refresh_scores(callback_query: CallbackQuery):
-    """Handle refresh_scores button clicks"""
+    """
+    Handle the 'Refresh Scores' button click event in the Telegram bot interface.
+    
+    This function is triggered when a user clicks the "Refresh Scores" button to get
+    the most up-to-date exam scores or rankings. It provides real-time feedback by
+    showing a temporary notification while fetching the latest data.
+    
+    The function performs the following steps:
+    1. Shows a temporary notification to indicate the refresh operation is in progress
+    2. Fetches the latest scores data from the source system using fetch_scores()
+    3. Recreates the refresh button to allow subsequent refreshes
+    4. Handles possible error conditions from the data fetch
+    5. In the success case, formats the scores into a readable message
+    6. Updates the original message with either the formatted scores or an error message
+    
+    Parameters:
+        callback_query (CallbackQuery): The Telegram callback query object containing:
+            - message: The original message with the button that was clicked
+            - data: "refresh_scores" (filtered by the decorator)
+            
+    Side Effects:
+        - Shows a temporary notification to the user
+        - Makes an external API call to fetch the latest scores
+        - Modifies the original message to display updated scores
+        - Adds a refresh button to allow further refreshes
+        
+    Error Handling:
+        - If the fetch_scores() function returns an error, displays the error message
+          with an option to try again later
+        - If no scores are available, displays a message indicating this
+    
+    Related Functions:
+        - fetch_scores: Retrieves the latest scores data from the external system
+        - handle_view_scores: Initial command handler that first displays the scores
+    
+    Returns:
+        None
+    """
     await callback_query.answer("Refreshing scores...")
 
     # Fetch latest scores
@@ -1366,7 +1572,41 @@ async def process_refresh_scores(callback_query: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("subscribe_"))
 async def process_subscription_response(callback_query: CallbackQuery):
-    """Handle subscription button clicks"""
+    """
+    Handle subscription preference selections from users in the Telegram bot interface.
+
+    This function processes user responses to subscription prompts, allowing them to opt-in
+    or opt-out of receiving notifications about exam results. It's triggered when a user
+    clicks either the "Yes" or "No" button in the subscription dialog.
+
+    The function performs the following steps:
+    1. Extracts the user's choice from the callback data ("yes" or any other value)
+    2. For "yes" responses:
+    - [TODO] Stores the user's subscription preference in the database
+    - Confirms successful subscription with a message
+    3. For "no" responses:
+    - Informs the user their subscription was cancelled
+    - Reminds them they can subscribe later using the /subscribe command
+    4. Acknowledges the callback query to remove the loading state from the clicked button
+
+    Parameters:
+        callback_query (CallbackQuery): The Telegram callback query object containing:
+            - data: String starting with "subscribe_" followed by the user's choice
+            - message: The original message with subscription options
+            - from_user: Information about the user who clicked the button
+
+    Side Effects:
+        - Modifies the original message to show confirmation of user's subscription choice
+        - Will save subscription preference in database once implemented
+        - Acknowledges the callback query to remove loading state from the button
+
+    Related Functions:
+        - handle_subscribe: Initial command handler that presents the subscription options
+        - Other notification-related functions that use subscription preferences
+
+    Returns:
+        None
+    """
     choice = callback_query.data.split("_")[1]
 
     if choice == "yes":
@@ -1390,16 +1630,16 @@ async def process_subscription_response(callback_query: CallbackQuery):
 async def process_score_callback(callback_query: CallbackQuery):
     """
     Handle score range selection for ranking calculation.
-    
+
     This function processes a user's score range selection when they use the
     /checkscore command. It either uses a predefined score from the button
     or transitions to a state where the user can input a custom score.
     The function then calculates and displays where the user would rank
     in the current standings with that score.
-    
+
     Args:
         callback_query (CallbackQuery): The callback query containing the selected score range
-        
+
     Returns:
         None
     """
@@ -1463,7 +1703,48 @@ async def process_score_callback(callback_query: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "create_profile")
 async def process_create_profile(callback_query: CallbackQuery):
-    """Handle create_profile button clicks"""
+    """
+    Handle the 'Create Profile' button click event in the Telegram bot interface.
+
+    This function is triggered when a user clicks the "Create Profile" button, initiating the
+    profile creation workflow. It's the entry point for new users to set up their profile
+    in the system.
+
+    The function performs the following steps:
+    1. Initializes a new empty user profile structure in the global user_profiles dictionary
+    2. Presents a language selection interface with options for Chinese, English, and Russian
+    3. Updates the user's state to indicate they're in the language selection phase
+    4. Displays a trilingual welcome message with language selection buttons
+
+    The selected language will determine the language used for subsequent interactions
+    during the profile creation process.
+
+    Parameters:
+        callback_query (CallbackQuery): The Telegram callback query object containing:
+            - from_user.id: The unique Telegram user ID
+            - message: The original message with the button that was clicked
+            - data: "create_profile" (filtered by the decorator)
+
+    Side Effects:
+        - Creates/resets an entry in user_profiles dictionary for the user
+        - Updates user_states dictionary to track the user's profile creation progress
+        - Modifies the original message to show language selection options
+        - Acknowledges the callback query to remove loading state from the button
+
+    Follow-up States:
+        After this function, the user state is set to "waiting_for_language",
+        which will be handled by the language selection callback handler.
+
+    Related Functions:
+        - process_language_selection: Handles the language selection callback
+        - handle_name_input: Processes user's name after language selection
+        - handle_interests_input: Processes user's interests input
+        - handle_courses_input: Processes user's courses input
+        - save_user_profile: Saves the completed profile to the database
+
+    Returns:
+        None
+    """
     uid = callback_query.from_user.id
 
     # Initialize user profile
@@ -1579,6 +1860,7 @@ async def send_split_message(message: Message, text: str, parse_mode: str = None
     # Telegram's message size limit is around 4096 characters
     MAX_MESSAGE_LENGTH = 4000  # Using a slightly lower limit to be safe
 
+    print(text)
     if len(text) <= MAX_MESSAGE_LENGTH:
         # If message is short enough, send it directly
         return await message.reply(text, parse_mode=parse_mode)
@@ -1659,16 +1941,16 @@ async def send_split_message(message: Message, text: str, parse_mode: str = None
 async def clear_thread_if_needed(user_id, thread):
     """
     Periodically clear thread history if it gets too long to avoid context confusion.
-    
+
     This function checks if a thread has accumulated too many messages and
     creates a fresh thread if needed, preserving only the user profile context.
     This helps prevent the model from getting confused by lengthy conversation
     history or repeating previous answers.
-    
+
     Args:
         user_id (int): The user ID associated with the thread
         thread: The current thread object
-        
+
     Returns:
         The thread object (either the original or a new one if cleared)
     """
@@ -1680,28 +1962,34 @@ async def clear_thread_if_needed(user_id, thread):
             message_count = len(messages)
         except Exception:
             pass
-        
+
         # If thread has more than 20 messages, start a new one
         # This number can be adjusted based on performance
         if message_count > 20:
-            logger.info(f"[THREAD] Clearing long thread for user {user_id} with {message_count} messages")
-            
+            logger.info(
+                f"[THREAD] Clearing long thread for user {user_id} with {message_count} messages"
+            )
+
             # Create a new thread
             new_thread = sdk.threads.create(ttl_days=7, expiration_policy="static")
-            
+
             # Add user context to the new thread
             context_message = await build_user_context_message(user_id)
             if context_message:
                 try:
                     new_thread.write(context_message)
-                    logger.info(f"[CONTEXT] Added profile context to new thread after clearing for user {user_id}")
+                    logger.info(
+                        f"[CONTEXT] Added profile context to new thread after clearing for user {user_id}"
+                    )
                 except Exception:
-                    logger.warning(f"[CONTEXT] Could not add context to new thread after clearing for user {user_id}")
-            
+                    logger.warning(
+                        f"[CONTEXT] Could not add context to new thread after clearing for user {user_id}"
+                    )
+
             # Update the user's thread reference
             user_threads[user_id] = new_thread
             return new_thread
-        
+
         # Return original thread if no clearing needed
         return thread
     except Exception as e:
@@ -1713,7 +2001,7 @@ async def clear_thread_if_needed(user_id, thread):
 async def handle_user_message(message: Message):
     """
     Main message handler for all incoming user messages.
-    
+
     This function serves as the central dispatcher for processing user messages.
     It handles various states and conditions:
     1. Profile creation/state management
@@ -1721,13 +2009,13 @@ async def handle_user_message(message: Message):
     3. Explicit escalation commands
     4. LLM-based response generation
     5. Automatic escalation when needed
-    
+
     The function implements a priority-based decision tree to determine the
     appropriate action for each incoming message.
-    
+
     Args:
         message (Message): The Telegram message object from the user
-        
+
     Returns:
         None
     """
@@ -1742,11 +2030,17 @@ async def handle_user_message(message: Message):
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="🇨🇳 Chinese", callback_data="lang_zh"),
-                        InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+                        InlineKeyboardButton(
+                            text="🇨🇳 Chinese", callback_data="lang_zh"
+                        ),
+                        InlineKeyboardButton(
+                            text="🇬🇧 English", callback_data="lang_en"
+                        ),
                     ],
                     [
-                        InlineKeyboardButton(text="🇷🇺 Russian", callback_data="lang_ru"),
+                        InlineKeyboardButton(
+                            text="🇷🇺 Russian", callback_data="lang_ru"
+                        ),
                     ],
                 ]
             )
@@ -1821,9 +2115,17 @@ async def handle_user_message(message: Message):
 
     # Check if this is a new conversation and the message starts with a greeting
     # This can help reset context more aggressively when a new conversation starts
-    greeting_terms = ['привет', 'здравствуй', 'добрый день', 'доброе утро', 'добрый вечер', 'hello', 'hi']
+    greeting_terms = [
+        "привет",
+        "здравствуй",
+        "добрый день",
+        "доброе утро",
+        "добрый вечер",
+        "hello",
+        "hi",
+    ]
     is_greeting = any(text.lower().startswith(term) for term in greeting_terms)
-    
+
     # If this is a greeting and we have an existing thread, consider clearing it
     if is_greeting and uid in user_threads:
         logger.info(f"[THREAD] Detected greeting from user {uid}, may clear thread")
@@ -1833,20 +2135,24 @@ async def handle_user_message(message: Message):
             try:
                 # Create new thread regardless of message count
                 new_thread = sdk.threads.create(ttl_days=7, expiration_policy="static")
-                
+
                 # Add user context to the new thread
                 context_message = await build_user_context_message(user_id=uid)
                 if context_message:
                     try:
                         new_thread.write(context_message)
-                        logger.info(f"[CONTEXT] Added profile context to new thread after greeting for user {uid}")
+                        logger.info(
+                            f"[CONTEXT] Added profile context to new thread after greeting for user {uid}"
+                        )
                     except Exception:
                         pass
-                
+
                 # Update the user's thread reference
                 user_threads[uid] = new_thread
             except Exception:
-                logger.exception(f"[ERROR] Failed to reset thread after greeting for user {uid}")
+                logger.exception(
+                    f"[ERROR] Failed to reset thread after greeting for user {uid}"
+                )
 
     # 4) LLM response
     max_llm_retries = 2
@@ -1855,17 +2161,17 @@ async def handle_user_message(message: Message):
             # Check if we need to clear the thread before proceeding
             if uid in user_threads:
                 user_threads[uid] = await clear_thread_if_needed(uid, user_threads[uid])
-                
+
             # Use Yandex Pro LLM assistant
             reply, flag = await call_yc(uid, text)
-            
+
             # Successfully got a response, break the retry loop
             break
         except Exception as e:
             logger.exception(
                 f"[ERROR] LLM call failed for user {uid} on attempt {attempt+1}/{max_llm_retries}"
             )
-            
+
             # If this is the last attempt, use a fallback response
             if attempt == max_llm_retries - 1:
                 # Default generic error message and trigger escalation
@@ -1894,7 +2200,7 @@ async def handle_user_message(message: Message):
 
     # 6) Normal reply
     dialog_history[uid].append({"role": "assistant", "content": reply})
-    
+
     # Use the split message function to handle potentially long replies
     await send_split_message(message, reply, parse_mode="Markdown")
 
@@ -1927,18 +2233,22 @@ async def handle_name_input(message: Message):
 
     # Get user's language preference
     language = user_languages.get(uid, "en")
-    
+
     updating = user_states[uid].get("data", {}).get("updating", False)
-    
+
     # Prepare message based on language
     if language == "zh":
         if updating:
             interests_message = "您在考试或教育方面的主要兴趣是什么？"
         else:
-            interests_message = "您在考试或教育方面的主要兴趣是什么？（例如：数学，计算机科学，医学）"
+            interests_message = (
+                "您在考试或教育方面的主要兴趣是什么？（例如：数学，计算机科学，医学）"
+            )
     elif language == "ru":
         if updating:
-            interests_message = "Каковы ваши основные интересы в экзаменах или образовании?"
+            interests_message = (
+                "Каковы ваши основные интересы в экзаменах или образовании?"
+            )
         else:
             interests_message = "Каковы ваши основные интересы в экзаменах или образовании? (например, математика, информатика, медицина)"
     else:  # Default to English
@@ -1946,7 +2256,7 @@ async def handle_name_input(message: Message):
             interests_message = "What are your main interests in exams or education?"
         else:
             interests_message = "What are your main interests in exams or education? (e.g., math, computer science, medicine)"
-    
+
     await message.reply(
         interests_message,
         parse_mode="Markdown",
@@ -1976,17 +2286,21 @@ async def handle_interests_input(message: Message):
 
     # Update state to ask for courses
     user_states[uid]["state"] = "waiting_for_courses"
-    
+
     # Get user's language preference
     language = user_languages.get(uid, "en")
-    
+
     # Prepare message based on language
     if language == "zh":
         courses_message = "您目前正在学习或计划学习哪些课程或科目？"
     elif language == "ru":
-        courses_message = "Какие курсы или предметы вы сейчас изучаете или планируете изучать?"
+        courses_message = (
+            "Какие курсы или предметы вы сейчас изучаете или планируете изучать?"
+        )
     else:  # Default to English
-        courses_message = "What courses or subjects are you currently studying or planning to take?"
+        courses_message = (
+            "What courses or subjects are you currently studying or planning to take?"
+        )
 
     await message.reply(
         courses_message,
@@ -2020,7 +2334,7 @@ async def handle_courses_input(message: Message):
 
     # Get complete user profile
     profile = user_profiles.get(uid, {})
-    
+
     # Get language preference, default to English if not set
     language = user_languages.get(uid, "en")
 
@@ -2034,7 +2348,7 @@ async def handle_courses_input(message: Message):
             profile.get("name", ""),
             profile.get("interests", ""),
             profile.get("courses", ""),
-            language=language
+            language=language,
         )
 
         if not save_success:
@@ -2057,7 +2371,9 @@ async def handle_courses_input(message: Message):
         elif language == "ru":
             completion_message = "Спасибо за информацию! Чем я могу вам помочь сегодня?"
         else:  # Default to English
-            completion_message = "Thanks for the information! How can I assist you today?"
+            completion_message = (
+                "Thanks for the information! How can I assist you today?"
+            )
 
         # Just inform user that profiling is complete
         await message.reply(
@@ -2079,14 +2395,14 @@ async def handle_courses_input(message: Message):
 async def handle_manual_score_input(message: Message):
     """
     Handle manually entered exam score after selecting the custom score option.
-    
+
     This function processes a user-entered score value, validates that it's
     a number within the acceptable range (0-400), and then calculates and displays
     where the user would rank in the current standings with that score.
-    
+
     Args:
         message (Message): The Telegram message containing the user's score
-        
+
     Returns:
         None
     """
@@ -2116,7 +2432,9 @@ async def handle_manual_score_input(message: Message):
     user_states.pop(uid, None)
 
     # Fetch current scores
-    logger.info(f"[SCORE] Fetching scores for user {uid} with manual score {user_score}")
+    logger.info(
+        f"[SCORE] Fetching scores for user {uid} with manual score {user_score}"
+    )
     scores = await fetch_scores()
 
     if "error" in scores:
@@ -2316,34 +2634,35 @@ async def process_update_profile(callback_query: CallbackQuery):
 @app.route("/health", methods=["GET"])
 def health():
     """
-    Health check endpoint to verify the bot service is running correctly.
+    Health check endpoint for monitoring system status.
     
-    This endpoint provides a simple way to monitor the bot's availability.
-    It returns a 200 OK status with a JSON response indicating the service
-    is operational.
+    This endpoint provides a simple health check that returns the number of
+    active threads and users to verify the service is operational. It's
+    designed for use with monitoring systems and load balancers to confirm
+    the bot is functioning normally.
     
     Returns:
-        tuple: (JSON response, HTTP status code)
+        Flask response: JSON containing connection count and HTTP 200 status code
     """
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"connections": len(user_threads)}), 200
 
 
 @app.route("/claim", methods=["POST"])
 def receive_claim():
     """
     Endpoint for Admin-Bot to claim a user's ticket.
-    
+
     This endpoint allows the Admin-Bot to claim a ticket for a specific user,
     establishing a direct communication channel between the admin and user.
     Once claimed, the user's messages will be forwarded to the admin until
     the ticket is closed.
-    
+
     Expected JSON payload:
         {
             "ticket_id": "ticket identifier",
             "user_id": optional user ID if not retrievable from pending tickets
         }
-    
+
     Returns:
         tuple: (JSON response, HTTP status code)
     """
@@ -2366,20 +2685,20 @@ def receive_claim():
 def receive_admin_reply():
     """
     Endpoint for Admin-Bot to send replies to users or close tickets.
-    
+
     This endpoint receives admin replies to claimed tickets and forwards them
     to the corresponding user. It also handles ticket closure notifications,
     which resets the ticket state and returns the user to normal LLM interaction.
-    
+
     Expected JSON payload:
         {
             "ticket_id": "ticket identifier",
             "text": "admin's reply message"
         }
-    
+
     Returns:
         tuple: (JSON response, HTTP status code)
-        
+
     If the message text begins with "🔒 Ticket" or contains "closed by", the
     function treats it as a ticket closure notification and cleans up ticket state.
     """
@@ -2415,7 +2734,7 @@ def receive_admin_reply():
     try:
         # Format the admin reply
         admin_reply = f"👤 *Admin Reply:*\n\n{text}"
-        
+
         # Check if the message is too long
         MAX_MESSAGE_LENGTH = 4000
         if len(admin_reply) <= MAX_MESSAGE_LENGTH:
@@ -2439,14 +2758,14 @@ def receive_admin_reply():
                 ),
                 polling_loop,
             )
-            
+
             # Then split and send the content
             parts = []
             current_part = ""
-            
+
             # Try to split by paragraphs first
-            paragraphs = text.split('\n\n')
-            
+            paragraphs = text.split("\n\n")
+
             for paragraph in paragraphs:
                 if len(current_part) + len(paragraph) + 2 > MAX_MESSAGE_LENGTH:
                     if current_part:
@@ -2456,20 +2775,20 @@ def receive_admin_reply():
                         parts.append(paragraph)
                 else:
                     if current_part:
-                        current_part += '\n\n' + paragraph
+                        current_part += "\n\n" + paragraph
                     else:
                         current_part = paragraph
-            
+
             # Add the last part if not empty
             if current_part:
                 parts.append(current_part)
-            
+
             # Send all parts
             for i, part in enumerate(parts):
                 part_text = part
                 if len(parts) > 1:
                     part_text = f"(part {i+1}/{len(parts)})\n\n{part}"
-                
+
                 asyncio.run_coroutine_threadsafe(
                     bot.send_message(
                         chat_id=user_id,
@@ -2478,14 +2797,14 @@ def receive_admin_reply():
                     ),
                     polling_loop,
                 )
-                
+
                 # Small delay between messages to maintain order
                 if i < len(parts) - 1:
                     asyncio.run_coroutine_threadsafe(
                         asyncio.sleep(0.5),
                         polling_loop,
                     )
-                    
+
     except Exception:
         logger.exception(
             "Failed to send message to user %s for ticket %s", user_id, ticket_id
@@ -2513,17 +2832,17 @@ ADMIN_USER_IDS = (
 async def handle_admin(message: Message):
     """
     Handle the /admin command to show admin-only options and commands.
-    
+
     This function displays a list of administrative commands available only
     to users whose IDs are in the ADMIN_USER_IDS list. These commands provide
     access to bot statistics, user profile summaries, and other admin functions.
-    
+
     Args:
         message (Message): The Telegram message containing the /admin command
-        
+
     Returns:
         None
-        
+
     The function verifies that the user is in the admin list before responding,
     as enforced by the message filter in the decorator.
     """
@@ -2544,17 +2863,17 @@ async def handle_admin(message: Message):
 async def handle_view_summaries(message: Message):
     """
     Handle the /viewsummaries admin command to list all profile summaries.
-    
+
     This function retrieves and displays AI-generated summaries of all user
     profiles from the database. It's restricted to admin users only and
     provides a comprehensive view of user profiles for administrative purposes.
-    
+
     Args:
         message (Message): The Telegram message containing the /viewsummaries command
-        
+
     Returns:
         None
-        
+
     The function handles long responses by splitting the output into multiple
     messages if needed. It retrieves the 20 most recently updated profiles
     with summaries.
@@ -2571,15 +2890,15 @@ async def handle_view_summaries(message: Message):
             """
             ) as cursor:
                 profiles = await cursor.fetchall()
-        
+
         if not profiles:
             await message.reply(
                 "No profile summaries available yet.", parse_mode="Markdown"
             )
             return
-        
+
         summaries_text = "*📊 User Profile Summaries*\n\n"
-        
+
         for profile in profiles:
             user_id, name, summary, updated_at = (
                 profile["user_id"],
@@ -2590,7 +2909,7 @@ async def handle_view_summaries(message: Message):
             summaries_text += f"*👤 User:* {name} (ID: {user_id})\n"
             summaries_text += f"*Updated:* {updated_at}\n"
             summaries_text += f"*Summary:* {summary}\n\n"
-            
+
             # Split message if it gets too long
             if (
                 summaries_text
@@ -2599,14 +2918,14 @@ async def handle_view_summaries(message: Message):
             ):
                 await message.reply(summaries_text, parse_mode="Markdown")
                 summaries_text = "*📊 User Profile Summaries (continued)*\n\n"
-        
+
         # Send remaining text
         if (
             summaries_text
             and summaries_text != "*📊 User Profile Summaries (continued)*\n\n"
         ):
             await message.reply(summaries_text, parse_mode="Markdown")
-            
+
     except Exception as e:
         logger.exception("Failed to retrieve profile summaries")
         await message.reply(
@@ -2622,17 +2941,17 @@ async def handle_view_summaries(message: Message):
 async def handle_get_stats(message: Message):
     """
     Handle the /getstats admin command to show bot usage statistics.
-    
+
     This function gathers and displays comprehensive statistics about the bot's
     usage and performance. It retrieves database stats, memory usage, and active
     user metrics. This command is restricted to admin users only.
-    
+
     Args:
         message (Message): The Telegram message containing the /getstats command
-        
+
     Returns:
         None
-        
+
     The statistics include:
     - Database metrics: total profiles, profiles with summaries, newest profile, latest update
     - Memory metrics: active threads, active dialogs, pending escalations, claimed tickets
@@ -2646,14 +2965,14 @@ async def handle_get_stats(message: Message):
             ) as cursor:
                 result = await cursor.fetchone()
                 total_profiles = result["count"] if result else 0
-            
+
             # Count profiles with summaries
             async with db.execute(
                 "SELECT COUNT(*) as count FROM user_profiles WHERE profile_summary IS NOT NULL AND profile_summary != ''"
             ) as cursor:
                 result = await cursor.fetchone()
                 profiles_with_summaries = result["count"] if result else 0
-            
+
             # Get newest profile
             async with db.execute(
                 "SELECT created_at FROM user_profiles ORDER BY created_at DESC LIMIT 1"
@@ -2664,7 +2983,7 @@ async def handle_get_stats(message: Message):
                     if newest_profile_result
                     else "N/A"
                 )
-            
+
             # Get most recently updated profile
             async with db.execute(
                 "SELECT updated_at FROM user_profiles ORDER BY updated_at DESC LIMIT 1"
@@ -2675,7 +2994,7 @@ async def handle_get_stats(message: Message):
                     if latest_update_result
                     else "N/A"
                 )
-        
+
         # Memory stats
         active_threads = len(user_threads)
         active_dialogs = len(dialog_history)
@@ -2752,6 +3071,22 @@ if __name__ == "__main__":
 
     # 3) Signal handlers for graceful shutdown
     def _shutdown(_sig, _frame):
+        """
+        Handle graceful shutdown of the bot when receiving termination signals.
+        
+        This function is registered as a signal handler for SIGINT and SIGTERM.
+        It performs clean shutdown operations including:
+        1. Deleting all Yandex thread objects to free resources
+        2. Closing all database connections properly
+        3. Stopping the main event loop
+        
+        Args:
+            _sig: Signal number (unused but required by signal handler interface)
+            _frame: Current stack frame (unused but required by signal handler interface)
+            
+        Returns:
+            None
+        """
         logger.info("Shutdown signal received; stopping.")
 
         # Clean up Yandex threads
